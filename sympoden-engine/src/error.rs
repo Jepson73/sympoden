@@ -32,3 +32,22 @@ pub enum StoreError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 }
+
+/// Errors from the `content` module: parsing/validating a note's wire format.
+#[derive(Debug, Error)]
+pub enum ContentError {
+    #[error("malformed note: {0}")]
+    Malformed(String),
+}
+
+/// Errors from the `sync` module: composing a note into/out of a relay-bound
+/// envelope. Each variant wraps the lower-level error that actually occurred.
+#[derive(Debug, Error)]
+pub enum SyncError {
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+    #[error(transparent)]
+    Content(#[from] ContentError),
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+}
