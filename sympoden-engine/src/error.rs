@@ -23,3 +23,12 @@ pub enum CryptoError {
     #[error("malformed envelope or key material: {0}")]
     Malformed(String),
 }
+
+/// Errors from the `store` module: the local SQLCipher-encrypted database.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("database could not be opened with the given key")]
+    InvalidKey,
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
+}
