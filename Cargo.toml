@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["sympoden-engine", "sympoden-relay", "sympoden-cli"]
+
+[workspace.package]
+edition = "2024"
+publish = false

@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "symposia-engine"
+name = "sympoden-engine"
 version = "0.1.0"

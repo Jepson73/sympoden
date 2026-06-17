@@ -1,0 +1,25 @@
+[package]
+name = "sympoden-engine"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[dependencies]
+argon2 = { version = "0.5.3", default-features = false, features = ["std", "zeroize"] }
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core", "zeroize"] }
+hkdf = "0.13.0"
+rand_core = { version = "0.6", features = ["getrandom", "std"] }
+rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+thiserror = "2.0.18"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
