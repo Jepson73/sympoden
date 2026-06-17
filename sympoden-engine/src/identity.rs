@@ -3,7 +3,8 @@
 //! key reused via clamping) so signing and key-agreement stay cryptographically
 //! separate.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 use base64::Engine as _;
@@ -111,7 +112,18 @@ impl Identity {
 
         let serialized = serde_json::to_vec_pretty(&keyfile)
             .map_err(|e| IdentityError::Malformed(e.to_string()))?;
-        fs::write(path, serialized)?;
+
+        // create_new fails atomically if a file already exists at `path`, so a second
+        // `create` can never silently overwrite (and destroy) an existing identity.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => IdentityError::AlreadyExists,
+                _ => IdentityError::Io(e),
+            })?;
+        file.write_all(&serialized)?;
 
         Ok(Self {
             signing_key,
@@ -296,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn create_refuses_to_overwrite_garbage_but_unlock_rejects_tampered_keyfile() {
+    fn unlock_rejects_tampered_keyfile() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("identity.keyfile.json");
 
@@ -309,6 +321,24 @@ mod tests {
 
         let result = Identity::unlock(&path, "passphrase");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_refuses_to_overwrite_an_existing_keyfile() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        let first = Identity::create(&path, "first-passphrase").unwrap();
+        let result = Identity::create(&path, "second-passphrase");
+
+        assert!(matches!(result, Err(IdentityError::AlreadyExists)));
+
+        // The original identity must still be intact and unlockable.
+        let unlocked = Identity::unlock(&path, "first-passphrase").unwrap();
+        assert_eq!(
+            first.signing_key.verifying_key(),
+            unlocked.signing_key.verifying_key()
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@ use thiserror::Error;
 /// Errors from the `identity` module: keyfile creation, unlock, and persistence.
 #[derive(Debug, Error)]
 pub enum IdentityError {
+    #[error("a keyfile already exists at this path")]
+    AlreadyExists,
     #[error("incorrect passphrase")]
     InvalidPassphrase,
     #[error("passphrase key derivation failed")]
