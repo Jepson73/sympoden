@@ -196,9 +196,22 @@ fn cmd_sync(dir: &Path, relay_addr: &str) -> Result<(), CliError> {
         for stored in store.unsynced_own_notes(&my_pubkey_hex)? {
             let note = Note::from_stored(&stored)?;
             let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &peer)?;
-            client.push(&routing_key, &envelope_bytes)?;
-            store.mark_synced(&stored.id, now_unix())?;
-            println!("Pushed note {}", stored.id);
+            match client.push(&routing_key, &envelope_bytes)? {
+                sync::PushOutcome::Accepted => {
+                    store.mark_synced(&stored.id, now_unix())?;
+                    println!("Pushed note {}", stored.id);
+                }
+                sync::PushOutcome::RecipientSlotOccupied => {
+                    // The peer hasn't pulled their previous note yet - the relay
+                    // holds only one blob per recipient. Stop pushing for now; this
+                    // note (and any after it) stay pending for the next sync.
+                    println!(
+                        "Peer hasn't picked up their previous note yet - note {} stays pending.",
+                        stored.id
+                    );
+                    break;
+                }
+            }
         }
     } else {
         println!("No peer configured - skipping push.");

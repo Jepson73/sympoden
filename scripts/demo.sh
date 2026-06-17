@@ -82,6 +82,26 @@ if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY"; then
 fi
 echo "OK: note appears in Bob's local list"
 
+echo "==> Alice: post two notes before Bob picks up the first (no data loss)"
+FIRST_BODY="first note - $(date +%s)"
+SECOND_BODY="second note - $(date +%s)"
+printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" post "$FIRST_BODY" >/dev/null
+printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" post "$SECOND_BODY" >/dev/null
+PUSH1_OUTPUT=$(printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$PUSH1_OUTPUT" | grep -qi "stays pending"; then
+    echo "FAIL: expected the relay to reject the second push (one blob per recipient)"
+    exit 1
+fi
+printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+BOB_NOTES=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list)
+if ! echo "$BOB_NOTES" | grep -qF "$FIRST_BODY" || ! echo "$BOB_NOTES" | grep -qF "$SECOND_BODY"; then
+    echo "FAIL: a note was lost across two posts before the peer picked up the first"
+    exit 1
+fi
+echo "OK: both notes arrived - posting ahead of a sync never silently loses one"
+
 echo "==> Checking a wrong passphrase fails cleanly (no panic)"
 set +e
 WRONG_OUTPUT=$(printf 'totally-wrong\n' | "$CLI" --data-dir "$ALICE_DIR" list 2>&1)

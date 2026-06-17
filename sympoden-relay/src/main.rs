@@ -119,6 +119,12 @@ fn handle_request(request: Request, store: &SharedStore) -> Response {
     }
 }
 
+/// One blob waiting per routing key. A push to a key that's already holding an
+/// undelivered, unexpired blob is rejected rather than silently overwriting (and
+/// destroying) it - the client decides what to do (e.g. wait for the recipient to
+/// pull, then retry). The relay never queues multiple blobs per key.
+const OCCUPIED_ERROR: &str = "occupied";
+
 fn handle_push(
     routing_key: String,
     blob: String,
@@ -146,6 +152,17 @@ fn handle_push(
             error: Some("internal error".to_string()),
         };
     };
+
+    let occupied =
+        matches!(guard.get(&routing_key), Some(existing) if existing.expires_at > Instant::now());
+    if occupied {
+        return Response {
+            ok: false,
+            blob: None,
+            error: Some(OCCUPIED_ERROR.to_string()),
+        };
+    }
+
     guard.insert(routing_key, entry);
 
     Response {
@@ -230,6 +247,39 @@ mod tests {
         let pull_resp = request(addr, r#"{"op":"pull","routing_key":"abc123"}"#);
         assert!(pull_resp.ok);
         assert_eq!(pull_resp.blob, Some(blob));
+    }
+
+    #[test]
+    fn second_push_to_an_occupied_key_is_rejected_not_overwritten() {
+        let addr = start_test_relay();
+        let first_blob = BASE64.encode(b"first note");
+        let second_blob = BASE64.encode(b"second note");
+
+        let first_push = request(
+            addr,
+            &format!(r#"{{"op":"push","routing_key":"k9","blob":"{first_blob}"}}"#),
+        );
+        assert!(first_push.ok);
+
+        let second_push = request(
+            addr,
+            &format!(r#"{{"op":"push","routing_key":"k9","blob":"{second_blob}"}}"#),
+        );
+        assert!(!second_push.ok);
+        assert_eq!(second_push.error, Some(OCCUPIED_ERROR.to_string()));
+
+        // The first blob must still be exactly what was pushed - never overwritten.
+        let pull_resp = request(addr, r#"{"op":"pull","routing_key":"k9"}"#);
+        assert_eq!(pull_resp.blob, Some(first_blob));
+
+        // Now that the slot is free, the second note can be pushed and delivered.
+        let retry_push = request(
+            addr,
+            &format!(r#"{{"op":"push","routing_key":"k9","blob":"{second_blob}"}}"#),
+        );
+        assert!(retry_push.ok);
+        let second_pull = request(addr, r#"{"op":"pull","routing_key":"k9"}"#);
+        assert_eq!(second_pull.blob, Some(second_blob));
     }
 
     #[test]

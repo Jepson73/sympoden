@@ -150,14 +150,24 @@ fn sync_now(state: State<AppState>, relay: String) -> Result<SyncResult, String>
             let note = Note::from_stored(&stored).map_err(|e| e.to_string())?;
             let (routing_key, envelope_bytes) =
                 sync::prepare_outgoing(&note, &peer).map_err(|e| e.to_string())?;
-            client
+            let outcome = client
                 .push(&routing_key, &envelope_bytes)
                 .map_err(|e| e.to_string())?;
-            session
-                .store
-                .mark_synced(&stored.id, now_unix())
-                .map_err(|e| e.to_string())?;
-            pushed.push(stored.id);
+            match outcome {
+                sync::PushOutcome::Accepted => {
+                    session
+                        .store
+                        .mark_synced(&stored.id, now_unix())
+                        .map_err(|e| e.to_string())?;
+                    pushed.push(stored.id);
+                }
+                sync::PushOutcome::RecipientSlotOccupied => {
+                    // The peer hasn't pulled their previous note yet - the relay
+                    // holds only one blob per recipient. Stop pushing for now; this
+                    // note (and any after it) stay pending for the next sync.
+                    break;
+                }
+            }
         }
     }
 

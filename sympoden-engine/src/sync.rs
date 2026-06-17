@@ -42,6 +42,18 @@ pub fn receive_incoming(
 }
 
 const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
+// Matches sympoden-relay's OCCUPIED_ERROR sentinel. No shared crate between the two,
+// so this is duplicated deliberately, same as the rest of the wire protocol.
+const OCCUPIED_ERROR: &str = "occupied";
+
+/// The relay holds at most one undelivered blob per routing key. A push when that
+/// slot is already occupied is a normal, expected outcome (the recipient hasn't
+/// pulled the previous note yet) - not a transport error.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    Accepted,
+    RecipientSlotOccupied,
+}
 
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -74,8 +86,10 @@ impl RelayClient {
         Self { addr: addr.into() }
     }
 
-    /// Push an envelope to the relay under `routing_key`.
-    pub fn push(&self, routing_key: &[u8; 32], blob: &[u8]) -> Result<(), SyncError> {
+    /// Push an envelope to the relay under `routing_key`. Returns
+    /// `PushOutcome::RecipientSlotOccupied` (not an error) if the recipient hasn't
+    /// pulled their previous note yet - the relay holds only one blob per key.
+    pub fn push(&self, routing_key: &[u8; 32], blob: &[u8]) -> Result<PushOutcome, SyncError> {
         let request = RelayRequest::Push {
             routing_key: hex::encode(routing_key),
             blob: BASE64.encode(blob),
@@ -83,12 +97,14 @@ impl RelayClient {
         };
         let response = self.send(&request)?;
         if response.ok {
-            Ok(())
-        } else {
-            Err(SyncError::Relay(
-                response.error.unwrap_or_else(|| "push failed".to_string()),
-            ))
+            return Ok(PushOutcome::Accepted);
         }
+        if response.error.as_deref() == Some(OCCUPIED_ERROR) {
+            return Ok(PushOutcome::RecipientSlotOccupied);
+        }
+        Err(SyncError::Relay(
+            response.error.unwrap_or_else(|| "push failed".to_string()),
+        ))
     }
 
     /// Pull whatever is waiting under our own routing key, if anything.
@@ -213,7 +229,16 @@ mod tests {
         let client = RelayClient::new(addr.to_string());
 
         let result = client.push(&[0u8; 32], b"ciphertext");
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PushOutcome::Accepted);
+    }
+
+    #[test]
+    fn relay_client_push_reports_occupied_slot_without_erroring() {
+        let addr = start_mock_relay(r#"{"ok":false,"error":"occupied"}"#);
+        let client = RelayClient::new(addr.to_string());
+
+        let result = client.push(&[0u8; 32], b"ciphertext");
+        assert_eq!(result.unwrap(), PushOutcome::RecipientSlotOccupied);
     }
 
     #[test]
