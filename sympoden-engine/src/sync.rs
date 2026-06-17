@@ -1,7 +1,13 @@
-//! Composes a note into a relay-bound envelope and back. No network I/O lives here —
-//! that's the relay client, wired up alongside the CLI/UI once the relay binary
-//! exists. This module is the engine-internal glue between `content` and `crypto`.
+//! Composes a note into a relay-bound envelope and back, and talks to the relay
+//! over its TCP+JSON protocol. This is the engine-internal glue between `content`
+//! and `crypto`, plus the one place in the engine that does network I/O.
 
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use x25519_dalek::StaticSecret;
 
 use crate::content::Note;
@@ -33,6 +39,98 @@ pub fn receive_incoming(
     let note = Note::from_wire_bytes(&plaintext)?;
     note.verify()?;
     Ok(note)
+}
+
+const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Serialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+enum RelayRequest {
+    Push {
+        routing_key: String,
+        blob: String,
+        ttl_secs: u64,
+    },
+    Pull {
+        routing_key: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct RelayResponse {
+    ok: bool,
+    blob: Option<String>,
+    error: Option<String>,
+}
+
+/// A client for the blind relay's TCP+JSON protocol. Speaks the same wire format as
+/// `sympoden-relay` but shares no code or dependency with it.
+pub struct RelayClient {
+    addr: String,
+}
+
+impl RelayClient {
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self { addr: addr.into() }
+    }
+
+    /// Push an envelope to the relay under `routing_key`.
+    pub fn push(&self, routing_key: &[u8; 32], blob: &[u8]) -> Result<(), SyncError> {
+        let request = RelayRequest::Push {
+            routing_key: hex::encode(routing_key),
+            blob: BASE64.encode(blob),
+            ttl_secs: DEFAULT_TTL_SECS,
+        };
+        let response = self.send(&request)?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(SyncError::Relay(
+                response.error.unwrap_or_else(|| "push failed".to_string()),
+            ))
+        }
+    }
+
+    /// Pull whatever is waiting under our own routing key, if anything.
+    pub fn pull(&self, routing_key: &[u8; 32]) -> Result<Option<Vec<u8>>, SyncError> {
+        let request = RelayRequest::Pull {
+            routing_key: hex::encode(routing_key),
+        };
+        let response = self.send(&request)?;
+        if !response.ok {
+            return Err(SyncError::Relay(
+                response.error.unwrap_or_else(|| "pull failed".to_string()),
+            ));
+        }
+        match response.blob {
+            Some(encoded) => {
+                let bytes = BASE64
+                    .decode(&encoded)
+                    .map_err(|e| SyncError::Relay(e.to_string()))?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn send(&self, request: &RelayRequest) -> Result<RelayResponse, SyncError> {
+        let mut stream =
+            TcpStream::connect(&self.addr).map_err(|e| SyncError::Relay(e.to_string()))?;
+
+        let mut line =
+            serde_json::to_vec(request).map_err(|e| SyncError::Relay(e.to_string()))?;
+        line.push(b'\n');
+        stream
+            .write_all(&line)
+            .map_err(|e| SyncError::Relay(e.to_string()))?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .map_err(|e| SyncError::Relay(e.to_string()))?;
+        serde_json::from_str(&response_line).map_err(|e| SyncError::Relay(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +181,76 @@ mod tests {
     fn receive_incoming_rejects_malformed_bytes() {
         let secret = StaticSecret::random_from_rng(OsRng);
         let result = receive_incoming(b"not an envelope", &secret);
+        assert!(result.is_err());
+    }
+
+    /// A minimal stand-in for sympoden-relay: replies to one request per connection
+    /// with a canned response, so we can test RelayClient's wire-format handling
+    /// without depending on the relay binary.
+    fn start_mock_relay(response_body: impl Into<String>) -> std::net::SocketAddr {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let response_body = response_body.into();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let _ = stream.write_all(response_body.as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+        });
+
+        addr
+    }
+
+    #[test]
+    fn relay_client_push_succeeds_on_ok_response() {
+        let addr = start_mock_relay(r#"{"ok":true}"#);
+        let client = RelayClient::new(addr.to_string());
+
+        let result = client.push(&[0u8; 32], b"ciphertext");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn relay_client_pull_decodes_returned_blob() {
+        let blob = BASE64.encode(b"opaque ciphertext");
+        let addr = start_mock_relay(format!(r#"{{"ok":true,"blob":"{blob}"}}"#));
+        let client = RelayClient::new(addr.to_string());
+
+        let result = client.pull(&[0u8; 32]).unwrap();
+        assert_eq!(result, Some(b"opaque ciphertext".to_vec()));
+    }
+
+    #[test]
+    fn relay_client_pull_returns_none_when_nothing_pending() {
+        let addr = start_mock_relay(r#"{"ok":true}"#);
+        let client = RelayClient::new(addr.to_string());
+
+        let result = client.pull(&[0u8; 32]).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn relay_client_surfaces_error_responses() {
+        let addr = start_mock_relay(r#"{"ok":false,"error":"boom"}"#);
+        let client = RelayClient::new(addr.to_string());
+
+        let result = client.push(&[0u8; 32], b"ciphertext");
+        assert!(matches!(result, Err(SyncError::Relay(msg)) if msg == "boom"));
+    }
+
+    #[test]
+    fn relay_client_fails_cleanly_when_relay_is_unreachable() {
+        // Port 0 never accepts connections; this exercises the connect-failure path
+        // without depending on any particular port being closed in the test sandbox.
+        let client = RelayClient::new("127.0.0.1:0");
+        let result = client.pull(&[0u8; 32]);
         assert!(result.is_err());
     }
 }

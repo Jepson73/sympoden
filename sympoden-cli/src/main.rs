@@ -1,3 +1,246 @@
-fn main() {
-    println!("Hello, world!");
+//! Headless CLI harness for Slice 01: create an identity, post a note, sync it
+//! through a blind relay to a peer who is never online at the same time.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use clap::{Parser, Subcommand};
+use thiserror::Error;
+
+use sympoden_engine::content::Note;
+use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError};
+use sympoden_engine::identity::{Identity, PublicCard};
+use sympoden_engine::store::Store;
+use sympoden_engine::sync::{self, RelayClient};
+
+const KEYFILE_NAME: &str = "identity.keyfile.json";
+const DB_NAME: &str = "notes.sqlite";
+const PEER_NAME: &str = "peer.json";
+
+#[derive(Parser)]
+#[command(name = "sympoden-cli", about = "Slice 01 CLI harness")]
+struct Cli {
+    /// Directory holding this instance's keyfile, database, and peer card.
+    #[arg(long, default_value = "./sympoden-data")]
+    data_dir: PathBuf,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a new identity and local database in --data-dir.
+    Init,
+    /// Print this identity's public card, to share with a peer out-of-band.
+    Whoami,
+    /// Save a peer's public card (as printed by their `whoami`).
+    AddPeer { card: String },
+    /// Write and sign a new note, stored locally.
+    Post { body: String },
+    /// Push any unsynced notes to the relay, then pull anything waiting for us.
+    Sync {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        relay: String,
+    },
+    /// List all locally stored notes.
+    List,
+}
+
+#[derive(Debug, Error)]
+enum CliError {
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Sync(#[from] SyncError),
+    #[error(transparent)]
+    Content(#[from] ContentError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid peer card: {0}")]
+    InvalidCard(String),
+    #[error("no peer configured - run add-peer first")]
+    NoPeer,
+    #[error("passphrases did not match")]
+    PassphraseMismatch,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("sympoden-cli: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<(), CliError> {
+    match cli.command {
+        Command::Init => cmd_init(&cli.data_dir),
+        Command::Whoami => cmd_whoami(&cli.data_dir),
+        Command::AddPeer { card } => cmd_add_peer(&cli.data_dir, &card),
+        Command::Post { body } => cmd_post(&cli.data_dir, body),
+        Command::Sync { relay } => cmd_sync(&cli.data_dir, &relay),
+        Command::List => cmd_list(&cli.data_dir),
+    }
+}
+
+fn keyfile_path(dir: &Path) -> PathBuf {
+    dir.join(KEYFILE_NAME)
+}
+
+fn db_path(dir: &Path) -> PathBuf {
+    dir.join(DB_NAME)
+}
+
+fn peer_path(dir: &Path) -> PathBuf {
+    dir.join(PEER_NAME)
+}
+
+/// Prompt for a passphrase, hidden, via the controlling TTY. When there is no TTY
+/// (scripted/automated use, e.g. tests) there is no terminal to hide input from
+/// anyway, so fall back to a plain line on stdin rather than failing outright.
+fn prompt_passphrase(prompt: &str) -> Result<String, CliError> {
+    use std::io::IsTerminal;
+
+    if std::io::stdin().is_terminal() {
+        Ok(rpassword::prompt_password(prompt)?)
+    } else {
+        eprint!("{prompt}");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    }
+}
+
+fn unlock(dir: &Path) -> Result<Identity, CliError> {
+    let passphrase = prompt_passphrase("Passphrase: ")?;
+    Ok(Identity::unlock(&keyfile_path(dir), &passphrase)?)
+}
+
+fn cmd_init(dir: &Path) -> Result<(), CliError> {
+    fs::create_dir_all(dir)?;
+
+    let passphrase = prompt_passphrase("Choose a passphrase: ")?;
+    let confirm = prompt_passphrase("Confirm passphrase: ")?;
+    if passphrase != confirm {
+        return Err(CliError::PassphraseMismatch);
+    }
+
+    let identity = Identity::create(&keyfile_path(dir), &passphrase)?;
+    Store::open(&db_path(dir), &identity.db_key)?;
+
+    println!("Identity created in {}", dir.display());
+    Ok(())
+}
+
+fn cmd_whoami(dir: &Path) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let card = identity.public_card();
+    let encoded =
+        BASE64.encode(serde_json::to_vec(&card).map_err(|e| CliError::InvalidCard(e.to_string()))?);
+    println!("{encoded}");
+    Ok(())
+}
+
+fn cmd_add_peer(dir: &Path, card: &str) -> Result<(), CliError> {
+    let decoded = BASE64
+        .decode(card.trim())
+        .map_err(|e| CliError::InvalidCard(e.to_string()))?;
+    let parsed: PublicCard =
+        serde_json::from_slice(&decoded).map_err(|e| CliError::InvalidCard(e.to_string()))?;
+
+    // Validate the card actually parses into real keys before saving it.
+    parsed.ed25519_verifying_key()?;
+    parsed.x25519_public_key()?;
+
+    let serialized =
+        serde_json::to_vec_pretty(&parsed).map_err(|e| CliError::InvalidCard(e.to_string()))?;
+    fs::write(peer_path(dir), serialized)?;
+
+    println!("Peer added.");
+    Ok(())
+}
+
+fn load_peer(dir: &Path) -> Result<PublicCard, CliError> {
+    let raw = fs::read(peer_path(dir)).map_err(|_| CliError::NoPeer)?;
+    serde_json::from_slice(&raw).map_err(|e| CliError::InvalidCard(e.to_string()))
+}
+
+fn cmd_post(dir: &Path, body: String) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let store = Store::open(&db_path(dir), &identity.db_key)?;
+
+    let note = Note::new(&identity.signing_key, body, now_unix());
+    store.insert_note(&note.to_stored())?;
+
+    println!("Posted note {}", note.id_hex());
+    Ok(())
+}
+
+fn cmd_sync(dir: &Path, relay_addr: &str) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let store = Store::open(&db_path(dir), &identity.db_key)?;
+    let client = RelayClient::new(relay_addr.to_string());
+
+    if let Ok(peer) = load_peer(dir) {
+        let my_pubkey_hex = hex::encode(identity.signing_key.verifying_key().as_bytes());
+        for stored in store.unsynced_own_notes(&my_pubkey_hex)? {
+            let note = Note::from_stored(&stored)?;
+            let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &peer)?;
+            client.push(&routing_key, &envelope_bytes)?;
+            store.mark_synced(&stored.id, now_unix())?;
+            println!("Pushed note {}", stored.id);
+        }
+    } else {
+        println!("No peer configured - skipping push.");
+    }
+
+    let my_routing_key =
+        sympoden_engine::crypto::routing_key_for(&identity.signing_key.verifying_key());
+    match client.pull(&my_routing_key)? {
+        Some(envelope_bytes) => {
+            let note = sync::receive_incoming(&envelope_bytes, &identity.x25519_secret)?;
+            println!(
+                "Received note from {}: {}",
+                hex::encode(note.author_pubkey.as_bytes()),
+                note.body
+            );
+            store.insert_note(&note.to_stored())?;
+        }
+        None => println!("Nothing new from the relay."),
+    }
+
+    Ok(())
+}
+
+fn cmd_list(dir: &Path) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let store = Store::open(&db_path(dir), &identity.db_key)?;
+
+    for note in store.list_notes()? {
+        println!(
+            "[{}] {} ({}): {}",
+            note.created_at,
+            &note.id[..8.min(note.id.len())],
+            &note.author_pubkey[..8.min(note.author_pubkey.len())],
+            note.body
+        );
+    }
+    Ok(())
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

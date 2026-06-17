@@ -41,7 +41,8 @@ pub enum ContentError {
 }
 
 /// Errors from the `sync` module: composing a note into/out of a relay-bound
-/// envelope. Each variant wraps the lower-level error that actually occurred.
+/// envelope, and talking to the relay over the network. Each variant wraps the
+/// lower-level error that actually occurred.
 #[derive(Debug, Error)]
 pub enum SyncError {
     #[error(transparent)]
@@ -50,4 +51,6 @@ pub enum SyncError {
     Content(#[from] ContentError),
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    #[error("relay error: {0}")]
+    Relay(String),
 }
