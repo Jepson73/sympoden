@@ -199,6 +199,25 @@ mod tests {
     }
 
     #[test]
+    fn envelope_bytes_never_contain_the_plaintext() {
+        // envelope.to_bytes() is exactly what gets pushed to, and stored on, the
+        // relay - direct evidence the relay never holds plaintext, not just that
+        // decryption later succeeds.
+        let recipient_secret = StaticSecret::random_from_rng(OsRng);
+        let recipient_public = X25519PublicKey::from(&recipient_secret);
+
+        let secret_body = b"the eagle has landed at midnight";
+        let envelope = seal_for_recipient(secret_body, &recipient_public).unwrap();
+        let on_the_wire = envelope.to_bytes();
+
+        assert!(
+            !on_the_wire
+                .windows(secret_body.len())
+                .any(|window| window == secret_body)
+        );
+    }
+
+    #[test]
     fn open_fails_on_tampered_ciphertext() {
         let recipient_secret = StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519PublicKey::from(&recipient_secret);

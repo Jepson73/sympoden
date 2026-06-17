@@ -5,8 +5,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::StaticSecret;
 
@@ -117,8 +117,7 @@ impl RelayClient {
         let mut stream =
             TcpStream::connect(&self.addr).map_err(|e| SyncError::Relay(e.to_string()))?;
 
-        let mut line =
-            serde_json::to_vec(request).map_err(|e| SyncError::Relay(e.to_string()))?;
+        let mut line = serde_json::to_vec(request).map_err(|e| SyncError::Relay(e.to_string()))?;
         line.push(b'\n');
         stream
             .write_all(&line)
