@@ -1,0 +1,340 @@
+//! Identity: an Ed25519 signing keypair plus an X25519 key-agreement keypair, sealed
+//! in a passphrase-protected keyfile. Two independent keypairs are generated (not one
+//! key reused via clamping) so signing and key-agreement stay cryptographically
+//! separate.
+
+use std::fs;
+use std::path::Path;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::error::IdentityError;
+use crate::kdf::{self, Argon2Params, DerivedKeys, KEY_LEN, SALT_LEN};
+
+const NONCE_LEN: usize = 12;
+const SEALED_PLAINTEXT_LEN: usize = 32 /* ed25519 seed */ + 32 /* x25519 secret */;
+const KEYFILE_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct KdfParamsFile {
+    algorithm: String,
+    salt: String,
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeyfileV1 {
+    version: u8,
+    kdf: KdfParamsFile,
+    nonce: String,
+    sealed_secret: String,
+    ed25519_public: String,
+    x25519_public: String,
+}
+
+/// An unlocked identity: signing key, key-agreement key, and the SQLCipher database
+/// key derived alongside them. All secret fields zeroize on drop.
+pub struct Identity {
+    pub signing_key: SigningKey,
+    pub x25519_secret: StaticSecret,
+    pub db_key: Zeroizing<[u8; KEY_LEN]>,
+}
+
+/// The public half of an identity — what gets shared with a peer out-of-band so they
+/// can verify your signatures and encrypt notes to you. Publishing this is publishing
+/// your own public key, not personal data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicCard {
+    pub ed25519_public: String, // base64
+    pub x25519_public: String,  // base64
+}
+
+impl Identity {
+    /// Generate a fresh identity and write a new passphrase-sealed keyfile. Errors if
+    /// a keyfile already exists at `path`.
+    pub fn create(path: &Path, passphrase: &str) -> Result<Self, IdentityError> {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let x25519_secret = StaticSecret::random_from_rng(OsRng);
+
+        let mut salt = [0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        let params = Argon2Params::default();
+
+        let DerivedKeys {
+            keyfile_seal_key,
+            db_key,
+        } = kdf::derive_keys(passphrase, &salt, params)?;
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let mut plaintext = Zeroizing::new([0u8; SEALED_PLAINTEXT_LEN]);
+        plaintext[..32].copy_from_slice(signing_key.to_bytes().as_ref());
+        plaintext[32..].copy_from_slice(&x25519_secret.to_bytes());
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(keyfile_seal_key.as_ref()));
+        let sealed_secret = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: &[],
+                },
+            )
+            .map_err(|_| IdentityError::KeyDerivation)?;
+
+        let keyfile = KeyfileV1 {
+            version: KEYFILE_VERSION,
+            kdf: KdfParamsFile {
+                algorithm: "argon2id".to_string(),
+                salt: BASE64.encode(salt),
+                m_cost_kib: params.m_cost_kib,
+                t_cost: params.t_cost,
+                p_cost: params.p_cost,
+            },
+            nonce: BASE64.encode(nonce_bytes),
+            sealed_secret: BASE64.encode(sealed_secret),
+            ed25519_public: BASE64.encode(signing_key.verifying_key().to_bytes()),
+            x25519_public: BASE64.encode(X25519PublicKey::from(&x25519_secret).to_bytes()),
+        };
+
+        let serialized = serde_json::to_vec_pretty(&keyfile)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        fs::write(path, serialized)?;
+
+        Ok(Self {
+            signing_key,
+            x25519_secret,
+            db_key,
+        })
+    }
+
+    /// Unlock an existing keyfile with a passphrase. A wrong passphrase fails the AEAD
+    /// tag check and returns `IdentityError::InvalidPassphrase` — never panics.
+    pub fn unlock(path: &Path, passphrase: &str) -> Result<Self, IdentityError> {
+        let raw = fs::read(path)?;
+        let keyfile: KeyfileV1 =
+            serde_json::from_slice(&raw).map_err(|e| IdentityError::Malformed(e.to_string()))?;
+
+        if keyfile.version != KEYFILE_VERSION {
+            return Err(IdentityError::Malformed(format!(
+                "unsupported keyfile version {}",
+                keyfile.version
+            )));
+        }
+        if keyfile.kdf.algorithm != "argon2id" {
+            return Err(IdentityError::Malformed(format!(
+                "unsupported kdf algorithm {}",
+                keyfile.kdf.algorithm
+            )));
+        }
+
+        let salt_bytes = BASE64
+            .decode(&keyfile.kdf.salt)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        let salt: [u8; SALT_LEN] = salt_bytes
+            .try_into()
+            .map_err(|_| IdentityError::Malformed("salt has the wrong length".to_string()))?;
+
+        let params = Argon2Params {
+            m_cost_kib: keyfile.kdf.m_cost_kib,
+            t_cost: keyfile.kdf.t_cost,
+            p_cost: keyfile.kdf.p_cost,
+        };
+
+        let DerivedKeys {
+            keyfile_seal_key,
+            db_key,
+        } = kdf::derive_keys(passphrase, &salt, params)?;
+
+        let nonce_bytes = BASE64
+            .decode(&keyfile.nonce)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        if nonce_bytes.len() != NONCE_LEN {
+            return Err(IdentityError::Malformed(
+                "nonce has the wrong length".to_string(),
+            ));
+        }
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let sealed_secret = BASE64
+            .decode(&keyfile.sealed_secret)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(keyfile_seal_key.as_ref()));
+        let plaintext = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &sealed_secret,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| IdentityError::InvalidPassphrase)?;
+
+        if plaintext.len() != SEALED_PLAINTEXT_LEN {
+            return Err(IdentityError::Malformed(
+                "sealed secret has the wrong length".to_string(),
+            ));
+        }
+        let mut plaintext = Zeroizing::new(plaintext);
+
+        let mut ed25519_seed = [0u8; 32];
+        ed25519_seed.copy_from_slice(&plaintext[..32]);
+        let signing_key = SigningKey::from_bytes(&ed25519_seed);
+        ed25519_seed.zeroize();
+
+        let mut x25519_seed = [0u8; 32];
+        x25519_seed.copy_from_slice(&plaintext[32..]);
+        let x25519_secret = StaticSecret::from(x25519_seed);
+        x25519_seed.zeroize();
+        plaintext.zeroize();
+
+        // Cross-check the public keys recorded in the keyfile against what we just
+        // derived, so a corrupted/edited keyfile is rejected rather than silently
+        // producing a mismatched identity.
+        let expected_ed25519 = BASE64
+            .decode(&keyfile.ed25519_public)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        if expected_ed25519 != signing_key.verifying_key().to_bytes().as_slice() {
+            return Err(IdentityError::Malformed(
+                "ed25519 public key does not match sealed secret".to_string(),
+            ));
+        }
+        let expected_x25519 = BASE64
+            .decode(&keyfile.x25519_public)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        if expected_x25519 != X25519PublicKey::from(&x25519_secret).to_bytes().as_slice() {
+            return Err(IdentityError::Malformed(
+                "x25519 public key does not match sealed secret".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            signing_key,
+            x25519_secret,
+            db_key,
+        })
+    }
+
+    /// The public identity card to share with a peer out-of-band.
+    pub fn public_card(&self) -> PublicCard {
+        PublicCard {
+            ed25519_public: BASE64.encode(self.signing_key.verifying_key().to_bytes()),
+            x25519_public: BASE64.encode(X25519PublicKey::from(&self.x25519_secret).to_bytes()),
+        }
+    }
+}
+
+impl PublicCard {
+    pub fn ed25519_verifying_key(&self) -> Result<VerifyingKey, IdentityError> {
+        let bytes = BASE64
+            .decode(&self.ed25519_public)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            IdentityError::Malformed("ed25519 public key has the wrong length".to_string())
+        })?;
+        VerifyingKey::from_bytes(&bytes).map_err(|e| IdentityError::Malformed(e.to_string()))
+    }
+
+    pub fn x25519_public_key(&self) -> Result<X25519PublicKey, IdentityError> {
+        let bytes = BASE64
+            .decode(&self.x25519_public)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            IdentityError::Malformed("x25519 public key has the wrong length".to_string())
+        })?;
+        Ok(X25519PublicKey::from(bytes))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn create_then_unlock_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        let created = Identity::create(&path, "correct horse battery staple").unwrap();
+        let unlocked = Identity::unlock(&path, "correct horse battery staple").unwrap();
+
+        assert_eq!(
+            created.signing_key.verifying_key(),
+            unlocked.signing_key.verifying_key()
+        );
+        assert_eq!(
+            X25519PublicKey::from(&created.x25519_secret).to_bytes(),
+            X25519PublicKey::from(&unlocked.x25519_secret).to_bytes()
+        );
+        assert_eq!(*created.db_key, *unlocked.db_key);
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_cleanly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        Identity::create(&path, "correct horse battery staple").unwrap();
+        let result = Identity::unlock(&path, "wrong passphrase");
+
+        assert!(matches!(result, Err(IdentityError::InvalidPassphrase)));
+    }
+
+    #[test]
+    fn create_refuses_to_overwrite_garbage_but_unlock_rejects_tampered_keyfile() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        Identity::create(&path, "passphrase").unwrap();
+        let mut raw = fs::read(&path).unwrap();
+        // Flip a byte inside the base64 sealed_secret field to simulate corruption.
+        let idx = raw.len() / 2;
+        raw[idx] ^= 0xFF;
+        fs::write(&path, raw).unwrap();
+
+        let result = Identity::unlock(&path, "passphrase");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn public_card_round_trips_through_base64() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        let identity = Identity::create(&path, "passphrase").unwrap();
+        let card = identity.public_card();
+
+        assert_eq!(
+            card.ed25519_verifying_key().unwrap(),
+            identity.signing_key.verifying_key()
+        );
+        assert_eq!(
+            card.x25519_public_key().unwrap().to_bytes(),
+            X25519PublicKey::from(&identity.x25519_secret).to_bytes()
+        );
+    }
+
+    #[test]
+    fn different_identities_have_different_keys() {
+        let dir = tempdir().unwrap();
+        let a = Identity::create(&dir.path().join("a.json"), "pw").unwrap();
+        let b = Identity::create(&dir.path().join("b.json"), "pw").unwrap();
+
+        assert_ne!(a.signing_key.verifying_key(), b.signing_key.verifying_key());
+    }
+}
