@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
 
@@ -15,7 +16,7 @@ pub struct Store {
     conn: Connection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNote {
     pub id: String,            // hex SHA-256 content address
     pub author_pubkey: String, // hex Ed25519 public key

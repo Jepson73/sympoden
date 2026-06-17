@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Sympoden — Slice 01</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 440px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.1rem; }
+    section { margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid #ddd; }
+    textarea, input { width: 100%; box-sizing: border-box; margin: 0.25rem 0; }
+    button { margin: 0.25rem 0.25rem 0.25rem 0; }
+    .hidden { display: none; }
+    #status { color: #a00; min-height: 1.2em; }
+    ul#notes { list-style: none; padding: 0; }
+    ul#notes li { padding: 0.4rem 0; border-bottom: 1px solid #eee; }
+    .meta { color: #888; font-size: 0.8em; }
+  </style>
+</head>
+<body>
+  <h1>Sympoden — Slice 01</h1>
+  <p id="status"></p>
+
+  <section id="unlock-section">
+    <h2 id="unlock-heading">Unlock identity</h2>
+    <input id="passphrase" type="password" placeholder="Passphrase" />
+    <button id="unlock-btn">Unlock</button>
+    <button id="create-btn" class="hidden">Create identity</button>
+  </section>
+
+  <section id="app-section" class="hidden">
+    <h2>Your card</h2>
+    <p>Share this with your peer (they run "add peer" with it):</p>
+    <textarea id="my-card" rows="3" readonly></textarea>
+
+    <h2>Add a peer</h2>
+    <textarea id="peer-card" rows="3" placeholder="Paste your peer's card here"></textarea>
+    <button id="add-peer-btn">Add peer</button>
+
+    <h2>Write a note</h2>
+    <textarea id="note-body" rows="3" placeholder="What's on your mind?"></textarea>
+    <button id="post-btn">Post</button>
+
+    <h2>Relay</h2>
+    <input id="relay-addr" value="127.0.0.1:7878" />
+    <button id="sync-btn">Sync now</button>
+
+    <h2>Notes</h2>
+    <ul id="notes"></ul>
+  </section>
+
+  <script src="main.js"></script>
+</body>
+</html>

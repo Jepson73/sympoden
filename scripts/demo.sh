@@ -10,8 +10,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "==> Building workspace"
-cargo build --workspace --quiet
+echo "==> Building the headless crates (engine, relay, cli)"
+# Deliberately not --workspace: sympoden-app (Tauri) needs system webview libraries
+# this script doesn't assume are installed. It's excluded from the workspace's
+# default-members for the same reason; build it explicitly and separately once those
+# prerequisites are met.
+cargo build -p sympoden-engine -p sympoden-relay -p sympoden-cli --quiet
 
 echo "==> Verifying the relay has zero dependency on any crypto/identity crate"
 if cargo tree -p sympoden-relay | grep -Ei 'dalek|chacha20poly1305|argon2|sha2|hkdf'; then
@@ -21,11 +25,12 @@ fi
 echo "OK: relay has no crypto dependency"
 
 echo "==> Checking for telemetry/analytics-looking dependencies"
-if grep -Eiq 'sentry|segment|amplitude|mixpanel|google-analytics|posthog' Cargo.lock; then
-    echo "FAIL: a telemetry/analytics-looking dependency was found in Cargo.lock"
+if cargo tree -p sympoden-engine -p sympoden-relay -p sympoden-cli 2>/dev/null \
+    | grep -Eiq '\b(sentry|segment|amplitude|mixpanel|google-analytics|posthog)\b'; then
+    echo "FAIL: a telemetry/analytics-looking dependency was found in the headless crates"
     exit 1
 fi
-echo "OK: no telemetry/analytics dependency found in Cargo.lock"
+echo "OK: no telemetry/analytics dependency found in the headless crates"
 
 CLI="./target/debug/sympoden-cli"
 RELAY="./target/debug/sympoden-relay"

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["sympoden-engine", "sympoden-relay", "sympoden-cli"]
+members = ["sympoden-engine", "sympoden-relay", "sympoden-cli", "sympoden-app"]
+# sympoden-app (Tauri) needs system webview libraries (webkit2gtk/gtk on Linux) to
+# build, which a plain dev/CI box may not have. Keep it out of the default build set
+# so `cargo build`/`cargo test` with no -p flag still works headlessly; build it
+# explicitly with `cargo build -p sympoden-app` once those prerequisites are met.
+default-members = ["sympoden-engine", "sympoden-relay", "sympoden-cli"]
 
 [workspace.package]
 edition = "2024"
