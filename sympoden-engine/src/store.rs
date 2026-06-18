@@ -83,6 +83,11 @@ impl Store {
     }
 
     /// This identity's own notes that haven't been pushed to the relay yet.
+    ///
+    /// The `author_pubkey = ?1` clause is a correctness guard, not an optimization:
+    /// received (foreign-authored) notes are stored with `synced_at = NULL` too (see
+    /// `insert_note`), so without this filter sync would re-push someone else's note
+    /// back to the relay under our own routing key. Do not loosen or drop it.
     pub fn unsynced_own_notes(&self, my_pubkey_hex: &str) -> Result<Vec<StoredNote>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, author_pubkey, body, created_at, signature, synced_at
