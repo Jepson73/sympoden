@@ -34,7 +34,11 @@ recovery, polished UI. One screen, two buttons.
 follow vs friend; the ephemeral presence-gated layer + blind relay buffer; the two-secret
 model; **social recovery** (Shamir among trusted contacts); the **easy security tier**
 with convenient recovery; the "My circles" channel; a real (still simple) UI; the
-interaction-indexes / no-doomscroll feed behaviour.
+interaction-indexes / no-doomscroll feed behaviour; **author<->peer binding + key
+continuity (TOFU)** — on receive, match `author_pubkey` to a known peer and show their
+name, else flag as an unknown key (resolves Slice 01's accepted sender-authorization
+gap); **relay memory management** — active expiry/GC plus request limits, building on
+Slice 01's request-size cap (resolves Slice 01's accepted lazy-expiry gap).
 
 **Proves / validates the frontier:** can *nontechnical families* actually create
 identities, share, and recover a "lost" phone via social recovery? Test with real
