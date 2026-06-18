@@ -18,3 +18,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sympoden-engine = { path = "../sympoden-engine" }
 tauri = "2.11.3"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+base64 = "0.22.1"
+static_assertions = "1.1.0"
+tempfile = "3.27.0"

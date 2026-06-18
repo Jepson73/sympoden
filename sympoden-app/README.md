@@ -4,14 +4,44 @@ The Tauri desktop shell for Slice 01 — a thin view over `sympoden-engine`. No
 security logic lives here; see `src/main.rs` for the (small) set of Tauri commands
 that wrap the engine, and `ui/` for the hand-written, build-step-free HTML/JS frontend.
 
-**Unverified in this repo's dev sandbox**: it has no display server and is missing
-the system webview libraries Tauri needs to even compile on Linux, so this crate is
-excluded from the workspace's `default-members` (`cargo build`/`cargo test` with no
-`-p` flag skip it) and could not be built or run end-to-end here. `cargo check -p
-sympoden-app` was attempted and got as far as resolving and starting to build the
-full dependency tree before failing at a missing system library, which is the
-expected failure mode, not a code error - but the crate's own source has not been
-type-checked by a compiler. Treat it as a careful first draft, not a verified build.
+Every `#[tauri::command]` is a thin lock-and-delegate wrapper over a plain function
+(no Tauri types in its signature) that does the actual work, so the security-critical
+path - identity create/unlock, post, sync - is unit-tested headlessly by calling those
+plain functions directly, with no webview or display server involved. See the `tests`
+module at the bottom of `src/main.rs`: create/unlock roundtrip, a wrong passphrase
+failing cleanly (and never echoing the attempted passphrase back in the error), a
+post-then-list roundtrip, a full two-session sync exchange through a relay-protocol
+stand-in, and two tests proving no secret ever crosses into a command's return value -
+one at the type level (`Session`/`Identity`/`Store` don't implement `Serialize`, so a
+command literally cannot return them) and one that inspects the actual JSON shape of
+every return type. The app emits no Tauri events, so command return values and error
+strings are the whole IPC surface; there is no separate event channel to also audit.
+
+## Build status
+
+This crate is excluded from the workspace's `default-members` (`cargo build`/`cargo
+test` with no `-p` flag skip it) because it needs system webview libraries a plain
+dev/CI box may not have - see "Building on a real desktop" below. With those
+libraries present, `cargo build -p sympoden-app` and `cargo test -p sympoden-app` both
+succeed and have been verified to do so. `cargo clippy -p sympoden-app --all-targets`
+is clean.
+
+## Known residual risk: the webview glue itself is untested
+
+What's verified above is the engine logic behind each button - the Rust side of
+identity, storage, and sync. The webview glue (`ui/main.js` calling
+`window.__TAURI__.core.invoke`, the resulting render into the DOM) has **no**
+automated coverage, and can't get any in a sandbox with no display server and no
+WebDriver/`tauri-driver` tooling installed. "Done" here means compile-clean and
+headless-verified at the command layer, not "the two-button GUI was clicked through."
+A manual two-instance GUI walkthrough on a real desktop (see "Trying the Slice 01
+flow" below) is still outstanding and is the one acceptance step this crate's own
+test suite cannot stand in for.
+
+`icons/icon.png` is a solid-grey 256x256 placeholder, present only because
+`tauri.conf.json`'s window/bundle config requires an icon file to exist for the build
+to succeed at all. Replace it with real artwork whenever Slice 01 gets a visual design
+pass - explicitly out of scope here (see the slice's non-goals: no styling).
 
 ## Building on a real desktop
 
