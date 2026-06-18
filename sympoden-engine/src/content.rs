@@ -8,6 +8,10 @@ use crate::crypto;
 use crate::error::ContentError;
 use crate::store::StoredNote;
 
+/// Domain-separates a note's signed bytes from any other signable type that might be
+/// introduced later. Must never change once notes exist outside a throwaway prototype.
+const DOMAIN_TAG: &[u8] = b"sympoden-note-v1\0";
+
 /// A signed, content-addressed text note — the only post type Slice 01 has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
@@ -29,8 +33,13 @@ impl Note {
     /// Canonical bytes that get hashed (content address) and signed. Deliberately not
     /// JSON: field order/whitespace in a serialized format would make the signed
     /// bytes ambiguous, which would make signature verification fragile.
+    ///
+    /// Prefixed with a fixed domain tag so a future second signable type can never
+    /// collide with a note's signed bytes, even if its fields happened to encode the
+    /// same way.
     fn canonical_bytes(author_pubkey: &VerifyingKey, created_at: i64, body: &str) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(32 + 8 + body.len());
+        let mut bytes = Vec::with_capacity(DOMAIN_TAG.len() + 32 + 8 + body.len());
+        bytes.extend_from_slice(DOMAIN_TAG);
         bytes.extend_from_slice(author_pubkey.as_bytes());
         bytes.extend_from_slice(&created_at.to_be_bytes());
         bytes.extend_from_slice(body.as_bytes());
