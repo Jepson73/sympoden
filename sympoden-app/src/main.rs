@@ -443,12 +443,21 @@ mod tests {
         assert_eq!(notes[0].body, "hello, world");
     }
 
-    /// A minimal stand-in for sympoden-relay's push/pull protocol, so this test
-    /// exercises the real `RelayClient` -> TCP -> JSON path without depending on the
-    /// relay binary. Mirrors the pattern already used by
-    /// `sympoden_engine::sync::tests` and `sympoden_relay::tests` - same wire format,
-    /// same one-blob-per-key semantics, kept deliberately separate per-crate (no
-    /// shared dependency between the relay and anything that understands envelopes).
+    /// A real, in-process relay: a live TCP listener backed by a shared `HashMap`
+    /// that genuinely stores a pushed blob and returns those exact bytes on a later
+    /// pull (one-blob-per-key, via `Entry`'s occupied/vacant check - same semantics
+    /// as `sympoden-relay`'s actual rejection-not-overwrite behavior). This is not a
+    /// canned single-response double: `full_two_session_sync_exchange_via_relay`
+    /// below pushes through one `sync_now_inner` call and pulls through a second,
+    /// separate call, so the blob only round-trips correctly if this listener
+    /// actually persists it across connections - exactly the store-and-forward this
+    /// is here to prove `sync_now_inner` (the app's own push+pull+receive
+    /// orchestration, untouched by `scripts/demo.sh`, which exercises the CLI's
+    /// separate `cmd_sync` instead) gets right. It speaks the same wire format as
+    /// `sympoden_relay::main` and is structured the same way as that crate's own
+    /// `start_test_relay` test helper, but is a separate implementation - by design,
+    /// nothing here depends on the relay crate (the blind relay must structurally
+    /// share no crypto/identity dependency with anything that understands envelopes).
     fn start_test_relay() -> SocketAddr {
         use std::collections::HashMap;
         use std::io::{BufRead, BufReader, Write};

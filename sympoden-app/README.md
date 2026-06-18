@@ -10,8 +10,13 @@ path - identity create/unlock, post, sync - is unit-tested headlessly by calling
 plain functions directly, with no webview or display server involved. See the `tests`
 module at the bottom of `src/main.rs`: create/unlock roundtrip, a wrong passphrase
 failing cleanly (and never echoing the attempted passphrase back in the error), a
-post-then-list roundtrip, a full two-session sync exchange through a relay-protocol
-stand-in, and two tests proving no secret ever crosses into a command's return value -
+post-then-list roundtrip, a full two-session sync exchange through a real in-process
+relay (a live TCP listener with a genuine store-and-forward `HashMap`, not a canned
+single-response double - push and pull happen as two separate `sync_now_inner` calls,
+so the blob only round-trips if the listener actually persists it across connections;
+this is the only test proving the app's own push+pull+receive orchestration is
+correct, since `scripts/demo.sh` exercises the CLI's separate sync path instead), and
+two tests proving no secret ever crosses into a command's return value -
 one at the type level (`Session`/`Identity`/`Store` don't implement `Serialize`, so a
 command literally cannot return them) and one that inspects the actual JSON shape of
 every return type. The app emits no Tauri events, so command return values and error
