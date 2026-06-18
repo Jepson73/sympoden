@@ -125,7 +125,31 @@ Friend/circle (mutual, encrypted audience, may hold a leased copy).
 Reproducible builds; zero telemetry; encryption in transit at every tier; secrets
 zeroized; the engine headless-testable; invariants checked at every layer.
 
-## 9. The open frontier (read before scaling anything)
+## 9. Security properties and non-properties (as of Slice 01)
+
+A threat-model note, not a redesign — kept factual and tight.
+
+**HAVE:**
+- Confidentiality to the recipient and integrity of the envelope (sealed-box: fresh
+  ephemeral X25519 key + ChaCha20-Poly1305 AEAD per message).
+- Author commitment to key + timestamp + body (Ed25519 signature over canonical,
+  domain-separated bytes).
+- A structurally blind, non-logging relay (no crypto/identity dependency, no
+  per-connection logging).
+- An encrypted-at-rest local store (SQLite + SQLCipher).
+
+**DO NOT HAVE YET:**
+- Sender authorization (see Slice 01's accepted limitation on message authentication
+  vs. sender authorization).
+- Key continuity / TOFU (no binding yet between an `author_pubkey` and a recognized
+  peer identity — Phase 1).
+- Replay-window semantics (no defense against a captured, still-valid envelope being
+  replayed to the relay).
+- Resistance to relay-observable metadata: timing, blob size, and routing-key
+  correlation across pushes/pulls are all visible to the relay operator even though
+  content is not.
+
+## 10. The open frontier (read before scaling anything)
 
 Discovery, durable-layer hosting, and cold-start are **one** problem: you can only find
 durable content that someone hosts and that's findable, and all of it is weakest when the
