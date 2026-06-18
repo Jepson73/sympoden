@@ -10,6 +10,8 @@ use crate::store::StoredNote;
 
 /// Domain-separates a note's signed bytes from any other signable type that might be
 /// introduced later. Must never change once notes exist outside a throwaway prototype.
+/// Every future signable type (card, follow, ...) needs its own distinct tag — never
+/// reuse this one, or copy it onto a second type, or the collision this closes reopens.
 const DOMAIN_TAG: &[u8] = b"sympoden-note-v1\0";
 
 /// A signed, content-addressed text note — the only post type Slice 01 has.
