@@ -5,7 +5,7 @@
 //! what the protocol itself requires to operate.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,6 +19,10 @@ use thiserror::Error;
 const DEFAULT_ADDR: &str = "127.0.0.1:7878";
 const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// A single request line may never exceed this many bytes. Without a cap, one
+/// oversized line (no newline, ever larger) would make `read_line` grow its buffer
+/// without bound and exhaust memory.
+const MAX_REQUEST_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Error)]
 enum RelayError {
@@ -88,17 +92,26 @@ fn run() -> Result<(), RelayError> {
 }
 
 fn handle_connection(mut stream: TcpStream, store: &SharedStore) -> Result<(), RelayError> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let limited = stream.try_clone()?.take(MAX_REQUEST_BYTES);
+    let mut reader = BufReader::new(limited);
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    let response = match serde_json::from_str::<Request>(line.trim_end()) {
-        Ok(request) => handle_request(request, store),
-        Err(e) => Response {
+    let response = if !line.ends_with('\n') && line.len() as u64 >= MAX_REQUEST_BYTES {
+        Response {
             ok: false,
             blob: None,
-            error: Some(format!("malformed request: {e}")),
-        },
+            error: Some("request too large".to_string()),
+        }
+    } else {
+        match serde_json::from_str::<Request>(line.trim_end()) {
+            Ok(request) => handle_request(request, store),
+            Err(e) => Response {
+                ok: false,
+                blob: None,
+                error: Some(format!("malformed request: {e}")),
+            },
+        }
     };
 
     let mut serialized =
@@ -322,6 +335,25 @@ mod tests {
         let resp = request(addr, r#"{"op":"pull","routing_key":"k2"}"#);
         assert!(resp.ok);
         assert_eq!(resp.blob, None);
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_cleanly_not_oomed() {
+        let addr = start_test_relay();
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        // One huge line, no newline, well past MAX_REQUEST_BYTES - what an attacker
+        // trying to exhaust memory via an unbounded read_line would send.
+        let oversized = vec![b'a'; (MAX_REQUEST_BYTES + 1024) as usize];
+        stream.write_all(&oversized).unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let resp: Response = serde_json::from_str(&line).unwrap();
+
+        assert!(!resp.ok);
+        assert_eq!(resp.error, Some("request too large".to_string()));
     }
 
     #[test]
