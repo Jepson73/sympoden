@@ -193,6 +193,31 @@ mod tests {
     }
 
     #[test]
+    fn receive_incoming_rejects_a_decryptable_envelope_with_a_bad_signature() {
+        // The envelope decrypts cleanly (correct recipient key) but the note inside
+        // carries a corrupted signature. This pins down that `note.verify()?` in
+        // receive_incoming actually fires after decryption, not just that the
+        // signature primitive rejects bad signatures in isolation (crypto.rs already
+        // covers that).
+        let dir = tempdir().unwrap();
+        let alice = Identity::create(&dir.path().join("alice.json"), "alice-pw").unwrap();
+        let bob = Identity::create(&dir.path().join("bob.json"), "bob-pw").unwrap();
+        let bob_card = bob.public_card();
+
+        let mut note = Note::new(&alice.signing_key, "hello bob".to_string(), 1_700_000_000);
+        let mut sig_bytes = note.signature.to_bytes();
+        sig_bytes[0] ^= 0xFF;
+        note.signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        let peer_x25519 = bob_card.x25519_public_key().unwrap();
+        let envelope =
+            crypto::seal_for_recipient(&note.to_wire_bytes().unwrap(), &peer_x25519).unwrap();
+
+        let result = receive_incoming(&envelope.to_bytes(), &bob.x25519_secret);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn receive_incoming_rejects_malformed_bytes() {
         let secret = StaticSecret::random_from_rng(OsRng);
         let result = receive_incoming(b"not an envelope", &secret);
