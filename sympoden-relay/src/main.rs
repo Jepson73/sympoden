@@ -334,10 +334,11 @@ mod tests {
     }
 
     #[test]
-    fn relay_never_stores_or_returns_anything_resembling_plaintext_metadata() {
-        // The relay's Response/Entry types only ever carry base64 blob bytes and a
-        // routing key string supplied by the client — there is no field for, and no
-        // code path that reads, a peer address, a plaintext body, or any identity.
+    fn push_pull_round_trips_blob_unchanged() {
+        // What comes back is exactly the same base64 ciphertext we put in - the relay
+        // round-trips opaque bytes, it does not parse or re-derive anything from them.
+        // (This proves round-trip fidelity only; the proof that the relay never sees
+        // plaintext in the first place is crypto.rs::envelope_bytes_never_contain_the_plaintext.)
         let addr = start_test_relay();
         let blob = BASE64.encode(b"the eagle has landed");
 
@@ -347,8 +348,6 @@ mod tests {
         );
         let resp = request(addr, r#"{"op":"pull","routing_key":"k3"}"#);
 
-        // What comes back is exactly the same base64 ciphertext we put in - the relay
-        // round-trips opaque bytes, it does not parse or re-derive anything from them.
         assert_eq!(resp.blob, Some(blob));
     }
 }
