@@ -70,6 +70,24 @@ follow/friend relationships · the world channel · ranking · multi-device · p
 Two-way exchange; multiple notes; a second note type; a trivial one-way "follow" so B
 auto-pulls A's future notes. Anything more belongs to Phase 1 — see `docs/ROADMAP.md`.
 
+## Known limitations (accepted for Slice 01)
+
+a. **No sender authorization.** Adding a peer only designates who *you* send to; on
+   receive, any self-consistently-signed note sealed to your X25519 key and pushed
+   under your routing key is accepted and shown by raw key. Anyone holding your public
+   card can do this. Impersonating a *specific* peer is still impossible (that needs
+   their signing key) — this is message authentication, not sender authorization,
+   currently an emergent property and hereby an accepted one for this slice.
+b. **Relay expiry is lazy-only.** Entries are reaped on access (push/pull), not by an
+   active sweep, so relay memory is not yet bounded for keys that are never pulled
+   again.
+c. **Note ordering is author-chosen.** `created_at` is an author-signed timestamp; a
+   writer can place their note anywhere in the recipient's timeline.
+d. **Criterion 4 ("no hidden network calls") is partially evidenced, not proven.** It
+   currently rests on (i) no named-analytics dependency and (ii) inspection showing the
+   only network egress in engine+cli+relay is the relay protocol. It is *not yet*
+   verified under network isolation, and `sympoden-app` (Tauri) is unaudited.
+
 ## Invariant check for this slice
 
 No personal data (keyfile only) ✓ · no ads/engine ✓ · relay is blind and stateless-ish
