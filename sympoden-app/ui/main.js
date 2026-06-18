@@ -101,7 +101,9 @@ syncBtn.addEventListener("click", async () => {
   try {
     const result = await invoke("sync_now", { relay: relayAddrInput.value });
     const parts = [];
-    if (result.pushed.length) parts.push(`pushed ${result.pushed.length} note(s)`);
+    // "Handed to the relay", not "delivered" - it's delivered once the peer syncs,
+    // within the relay's retention window (best-effort is labelled best-effort).
+    if (result.pushed.length) parts.push(`handed ${result.pushed.length} note(s) to the relay`);
     parts.push(result.received ? "received a new note" : "nothing new from the relay");
     showStatus(parts.join(", ") + ".", false);
     await refreshNotes();

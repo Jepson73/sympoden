@@ -199,7 +199,14 @@ fn cmd_sync(dir: &Path, relay_addr: &str) -> Result<(), CliError> {
             match client.push(&routing_key, &envelope_bytes)? {
                 sync::PushOutcome::Accepted => {
                     store.mark_synced(&stored.id, now_unix())?;
-                    println!("Pushed note {}", stored.id);
+                    // "Handed to the relay", not "delivered" - the relay buffers it
+                    // until the peer's next sync, within its retention window; if
+                    // that window lapses first, the relay forgets it (invariant #6:
+                    // best-effort is labelled best-effort, not overstated as done).
+                    println!(
+                        "Handed note {} to the relay (delivered once your peer next syncs)",
+                        stored.id
+                    );
                 }
                 sync::PushOutcome::RecipientSlotOccupied => {
                     // The peer hasn't pulled their previous note yet - the relay

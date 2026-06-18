@@ -43,3 +43,13 @@ cargo tauri dev
    window entirely.
 5. In Bob's window (already running, or launched fresh later): click "Sync now" —
    Alice's note should appear in the list.
+
+## Known limitation: "handed to the relay" is not "delivered"
+
+The relay holds at most one undelivered blob per recipient, with a 24h default TTL.
+"Sync now" reports a note as handed to the relay, not delivered — it's delivered once
+the peer actually syncs. If the peer doesn't sync before the relay's TTL lapses, the
+relay forgets the blob and there's no automatic re-send; re-post (or re-sync once the
+peer has caught up on whatever was occupying their slot) to retry. Reliable
+re-delivery/retention is a Phase-1 concern (see `docs/ARCHITECTURE.md` §6); Slice 01's
+job is to prove the async exchange works at all, not to make it durable.
