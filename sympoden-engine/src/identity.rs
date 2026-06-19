@@ -410,6 +410,53 @@ mod tests {
     }
 
     #[test]
+    fn absurd_m_cost_is_rejected_cleanly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        Identity::create(&path, "passphrase").unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // u32::MAX KiB is ~4 TiB. If this weren't bounds-checked before allocating,
+        // attempting to unlock would OOM the process instead of returning an error.
+        raw["kdf"]["m_cost_kib"] = serde_json::json!(u32::MAX);
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let result = Identity::unlock(&path, "passphrase");
+        assert!(matches!(result, Err(IdentityError::Malformed(_))));
+    }
+
+    #[test]
+    fn unsupported_keyfile_version_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        Identity::create(&path, "passphrase").unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        raw["version"] = serde_json::json!(99u8);
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let result = Identity::unlock(&path, "passphrase");
+        assert!(matches!(result, Err(IdentityError::Malformed(_))));
+    }
+
+    #[test]
+    fn unsupported_kdf_algorithm_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.keyfile.json");
+
+        Identity::create(&path, "passphrase").unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        raw["kdf"]["algorithm"] = serde_json::json!("argon2i");
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let result = Identity::unlock(&path, "passphrase");
+        assert!(matches!(result, Err(IdentityError::Malformed(_))));
+    }
+
+    #[test]
     fn different_identities_have_different_keys() {
         let dir = tempdir().unwrap();
         let a = Identity::create(&dir.path().join("a.json"), "pw").unwrap();
