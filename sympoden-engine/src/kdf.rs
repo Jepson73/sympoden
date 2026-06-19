@@ -26,12 +26,23 @@ pub struct Argon2Params {
 }
 
 impl Default for Argon2Params {
-    /// OWASP-recommended Argon2id defaults: 19 MiB memory, 2 iterations, 1 thread.
+    /// RFC 9106 §4's second recommended option (for when 2 GiB isn't assumed
+    /// available): 64 MiB memory, 3 iterations, 4 lanes. This is a desktop-app
+    /// profile, not a resource-constrained one — sympoden runs on the user's own
+    /// machine, not a shared server budgeting memory across many concurrent logins —
+    /// so we pick RFC 9106's stronger-than-OWASP-minimum option over the lighter
+    /// 19 MiB profile previously used here.
+    ///
+    /// This only changes params for *newly created* keyfiles (`Identity::create`);
+    /// existing keyfiles carry their own `kdf.{m_cost_kib,t_cost,p_cost}` and are
+    /// unaffected. 65536/3/4 sits comfortably inside the
+    /// `[M_COST_KIB_FLOOR, M_COST_KIB_CEILING]` / `[T_COST_FLOOR, T_COST_CEILING]` /
+    /// `[P_COST_FLOOR, P_COST_CEILING]` bounds enforced in `identity.rs::unlock`.
     fn default() -> Self {
         Self {
-            m_cost_kib: Params::DEFAULT_M_COST,
-            t_cost: Params::DEFAULT_T_COST,
-            p_cost: Params::DEFAULT_P_COST,
+            m_cost_kib: 65536,
+            t_cost: 3,
+            p_cost: 4,
         }
     }
 }
