@@ -32,14 +32,16 @@ const KEYFILE_VERSION: u8 = 1;
 // runs, so an absurd value is rejected with a typed error instead of attempting a
 // multi-gigabyte (or u32::MAX-KiB ≈ 4 TiB) allocation.
 //
-// - Floor 8 MiB: RFC 9106's hard minimum is `m_cost >= 8 * p_cost`; 8192 KiB clears
-//   that for any `p_cost` this file also allows, and sits *below* the 19456 KiB
-//   (19 MiB) OWASP default this codebase ships (`Argon2Params::default()`), so
-//   every keyfile ever produced by `create` still unlocks.
+// - Floor 19 MiB: this is the OWASP-acceptable minimum and the value every keyfile
+//   this codebase has ever shipped was created with (the original
+//   `Argon2Params::default()`, before it was later raised further), so no existing
+//   keyfile is excluded. It doubles as a downgrade guard: a keyfile (hand-edited,
+//   corrupted, or restored from somewhere less trusted) cannot claim an m_cost
+//   weaker than the OWASP minimum and still be accepted.
 // - Ceiling 1 GiB: far beyond any cited Argon2id profile (OWASP's highest is 2 GiB
 //   for latency-insensitive, HSM-backed use), while nowhere near enough to OOM a
 //   desktop on its own.
-const M_COST_KIB_FLOOR: u32 = 8 * 1024;
+const M_COST_KIB_FLOOR: u32 = 19456;
 const M_COST_KIB_CEILING: u32 = 1024 * 1024;
 
 // t_cost: RFC 9106 minimum is 1 pass. A ceiling of 10 is already well past any
