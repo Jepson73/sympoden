@@ -9,6 +9,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::error::StoreError;
 
@@ -31,7 +32,12 @@ impl Store {
     /// `db_key`. A wrong key fails cleanly on first read, never panics.
     pub fn open(path: &Path, db_key: &[u8; 32]) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(db_key)))?;
+        // Both the hex encoding of the raw key and the PRAGMA string built from it are
+        // transient copies of secret key material on the heap; zeroize each on drop
+        // rather than leaving them for the allocator to hand out unwiped.
+        let hex_key = Zeroizing::new(hex::encode(db_key));
+        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", *hex_key));
+        conn.execute_batch(&pragma)?;
 
         // PRAGMA key alone doesn't validate it — SQLCipher only checks the key against
         // the file's contents on first real read. Force that check now so a wrong key
