@@ -296,11 +296,14 @@ fn main() {
         ])
         .run(tauri::generate_context!());
 
-    // Standard Tauri pattern: `run` only errors if the webview framework itself
-    // fails to initialize, which is unrecoverable - there's no UI left to report
-    // into. Every Tauri app does this; it's the framework's intended top level.
-    #[allow(clippy::expect_used)]
-    result.expect("error while running the sympoden-app");
+    // `run` only errors if the webview framework itself fails to initialize - there's
+    // no UI left to report into, so stderr plus a nonzero exit is the cleanest this
+    // can do. Still never panics: a failure here is an environment problem (missing
+    // webview, display server, ...), not a bug to crash loudly over.
+    if let Err(e) = result {
+        eprintln!("error while running the sympoden-app: {e}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
