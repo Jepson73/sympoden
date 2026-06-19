@@ -38,10 +38,10 @@ identity, storage, and sync. The webview glue (`ui/main.js` calling
 `window.__TAURI__.core.invoke`, the resulting render into the DOM) has **no**
 automated coverage, and can't get any in a sandbox with no display server and no
 WebDriver/`tauri-driver` tooling installed. "Done" here means compile-clean and
-headless-verified at the command layer, not "the two-button GUI was clicked through."
-A manual two-instance GUI walkthrough on a real desktop (see "Trying the Slice 01
-flow" below) is still outstanding and is the one acceptance step this crate's own
-test suite cannot stand in for.
+headless-verified at the command layer; "the two-button GUI was clicked through" is a
+separate, manual step. A two-instance GUI walkthrough on a real desktop (see "Trying
+the Slice 01 flow" below) was completed on 2026-06-18, covering the one acceptance
+step this crate's own test suite cannot stand in for.
 
 `icons/icon.png` is a solid-grey 256x256 placeholder, present only because
 `tauri.conf.json`'s window/bundle config requires an icon file to exist for the build

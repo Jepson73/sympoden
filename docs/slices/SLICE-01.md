@@ -53,13 +53,12 @@ A **desktop** app (Tauri + Rust engine) where:
    calls**.
 5. A wrong passphrase fails to unlock the keyfile cleanly (no panic, typed error).
 
-**Status:** code-complete and headless-verified — `cargo test` (workspace) and
-`scripts/demo.sh` cover criteria 1, 2, 3, 5 end-to-end at the engine/CLI level, and
-`sympoden-app`'s command layer (criteria 1, 2, 5 through the Tauri commands
-themselves) is unit-tested the same way, with no display server involved. The one
-acceptance step not yet done: an actual two-instance GUI click-through of criteria 1–2
-on a real desktop (sympoden-app/README.md has the walkthrough) — still outstanding,
-manual, and owed before this slice can be called fully closed.
+**Status:** code-complete, headless-verified, and GUI-verified — `cargo test`
+(workspace) and `scripts/demo.sh` cover criteria 1, 2, 3, 5 end-to-end at the
+engine/CLI level, and `sympoden-app`'s command layer (criteria 1, 2, 5 through the
+Tauri commands themselves) is unit-tested the same way, with no display server
+involved. The two-instance GUI click-through of criteria 1–2 on a real desktop
+(sympoden-app/README.md has the walkthrough) was manually verified on 2026-06-18.
 
 ## Explicit NON-goals (do not build these in Slice 01)
 
@@ -94,10 +93,10 @@ c. **Note ordering is author-chosen.** `created_at` is an author-signed timestam
 d. **Criterion 4 ("no hidden network calls") is partially evidenced, not proven.** It
    currently rests on (i) no named-analytics dependency and (ii) inspection showing the
    only network egress in engine+cli+relay is the relay protocol. It is *not yet*
-   verified under network isolation. `sympoden-app`'s command layer is now built,
-   clippy-clean, and unit-tested headlessly (see Status above), but its webview glue
-   (JS `invoke()` calls, rendering) has no automated coverage and has not been
-   exercised through an actual GUI session in this environment.
+   verified under network isolation. `sympoden-app`'s command layer is built,
+   clippy-clean, and unit-tested headlessly (see Status above); its webview glue
+   (JS `invoke()` calls, rendering) has no automated coverage but was exercised through
+   an actual GUI session on 2026-06-18 (see Status above).
 
 ## Invariant check for this slice
 
