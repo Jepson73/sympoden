@@ -24,6 +24,34 @@ const NONCE_LEN: usize = 12;
 const SEALED_PLAINTEXT_LEN: usize = 32 /* ed25519 seed */ + 32 /* x25519 secret */;
 const KEYFILE_VERSION: u8 = 1;
 
+// Bounds on the Argon2id parameters read from an on-disk keyfile. The keyfile is
+// local user data, but it can still be hand-edited, corrupted, or (via backup/
+// restore/import in a later phase) come from somewhere less trusted than "this
+// process wrote it" — and `m_cost_kib` is, unguarded, an attacker-controlled
+// allocation size handed straight to argon2's hasher. Validate before any of that
+// runs, so an absurd value is rejected with a typed error instead of attempting a
+// multi-gigabyte (or u32::MAX-KiB ≈ 4 TiB) allocation.
+//
+// - Floor 8 MiB: RFC 9106's hard minimum is `m_cost >= 8 * p_cost`; 8192 KiB clears
+//   that for any `p_cost` this file also allows, and sits *below* the 19456 KiB
+//   (19 MiB) OWASP default this codebase ships (`Argon2Params::default()`), so
+//   every keyfile ever produced by `create` still unlocks.
+// - Ceiling 1 GiB: far beyond any cited Argon2id profile (OWASP's highest is 2 GiB
+//   for latency-insensitive, HSM-backed use), while nowhere near enough to OOM a
+//   desktop on its own.
+const M_COST_KIB_FLOOR: u32 = 8 * 1024;
+const M_COST_KIB_CEILING: u32 = 1024 * 1024;
+
+// t_cost: RFC 9106 minimum is 1 pass. A ceiling of 10 is already well past any
+// recommended profile (OWASP's highest cited t_cost is 4) and bounds unlock latency.
+const T_COST_FLOOR: u32 = 1;
+const T_COST_CEILING: u32 = 10;
+
+// p_cost: RFC 9106 minimum is 1 lane. A ceiling of 64 bounds thread/lane fan-out far
+// beyond any realistic core count, without constraining legitimate high-end configs.
+const P_COST_FLOOR: u32 = 1;
+const P_COST_CEILING: u32 = 64;
+
 #[derive(Serialize, Deserialize)]
 struct KdfParamsFile {
     algorithm: String,
@@ -149,6 +177,28 @@ impl Identity {
             return Err(IdentityError::Malformed(format!(
                 "unsupported kdf algorithm {}",
                 keyfile.kdf.algorithm
+            )));
+        }
+
+        // Bound-check before touching the salt, building `Argon2Params`, or calling
+        // into argon2 — a keyfile with an out-of-range m_cost must never reach the
+        // point of allocating memory for it.
+        if !(M_COST_KIB_FLOOR..=M_COST_KIB_CEILING).contains(&keyfile.kdf.m_cost_kib) {
+            return Err(IdentityError::Malformed(format!(
+                "m_cost_kib {} outside allowed range [{}, {}]",
+                keyfile.kdf.m_cost_kib, M_COST_KIB_FLOOR, M_COST_KIB_CEILING
+            )));
+        }
+        if !(T_COST_FLOOR..=T_COST_CEILING).contains(&keyfile.kdf.t_cost) {
+            return Err(IdentityError::Malformed(format!(
+                "t_cost {} outside allowed range [{}, {}]",
+                keyfile.kdf.t_cost, T_COST_FLOOR, T_COST_CEILING
+            )));
+        }
+        if !(P_COST_FLOOR..=P_COST_CEILING).contains(&keyfile.kdf.p_cost) {
+            return Err(IdentityError::Malformed(format!(
+                "p_cost {} outside allowed range [{}, {}]",
+                keyfile.kdf.p_cost, P_COST_FLOOR, P_COST_CEILING
             )));
         }
 
