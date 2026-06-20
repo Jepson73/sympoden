@@ -11,6 +11,7 @@ const passphraseInput = document.getElementById("passphrase");
 const unlockBtn = document.getElementById("unlock-btn");
 const createBtn = document.getElementById("create-btn");
 const myCardEl = document.getElementById("my-card");
+const peerLabelInput = document.getElementById("peer-label");
 const peerCardInput = document.getElementById("peer-card");
 const addPeerBtn = document.getElementById("add-peer-btn");
 const noteBodyInput = document.getElementById("note-body");
@@ -24,13 +25,35 @@ function showStatus(message, isError) {
   statusEl.style.color = isError ? "#a00" : "#070";
 }
 
+// `trust` is the JSON form of the engine's AuthorTrust: "Own" | "Unknown" |
+// {"Known": "<label>"}. Unknown must always read as unmistakably distinct from a
+// known peer's label - that distinctness is the whole security point of Slice 02
+// (see docs/slices/SLICE-02.md), so it gets its own class and a warning glyph, never
+// just the absence of a label.
+function describeTrust(trust) {
+  if (trust === "Own") {
+    return { text: "you", cssClass: "trust-own" };
+  }
+  if (trust === "Unknown") {
+    return { text: "⚠ unknown sender", cssClass: "trust-unknown" };
+  }
+  if (trust && typeof trust === "object" && typeof trust.Known === "string") {
+    return { text: trust.Known, cssClass: "trust-known" };
+  }
+  // Defensive fallback: an unrecognized shape must still read as untrusted, never as
+  // a silently-passed-through known peer.
+  return { text: "⚠ unknown sender", cssClass: "trust-unknown" };
+}
+
 async function refreshNotes() {
-  const notes = await invoke("list_notes");
+  const trustedNotes = await invoke("list_notes");
   notesList.innerHTML = "";
-  for (const note of notes) {
+  for (const trusted of trustedNotes) {
+    const note = trusted.note;
+    const { text: trustText, cssClass } = describeTrust(trusted.trust);
     const li = document.createElement("li");
     const when = new Date(note.created_at * 1000).toLocaleString();
-    li.innerHTML = `<div>${escapeHtml(note.body)}</div><div class="meta">${when} — ${note.author_pubkey.slice(0, 8)}…</div>`;
+    li.innerHTML = `<div>${escapeHtml(note.body)}</div><div class="meta">${when} — <span class="${cssClass}">${escapeHtml(trustText)}</span></div>`;
     notesList.appendChild(li);
   }
 }
@@ -79,8 +102,9 @@ createBtn.addEventListener("click", async () => {
 addPeerBtn.addEventListener("click", async () => {
   try {
     const decoded = atob(peerCardInput.value.trim());
-    await invoke("add_peer", { card: decoded });
+    await invoke("add_peer", { label: peerLabelInput.value.trim(), card: decoded });
     showStatus("Peer added.", false);
+    await refreshNotes();
   } catch (err) {
     showStatus(String(err), true);
   }

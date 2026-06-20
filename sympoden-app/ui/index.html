@@ -14,6 +14,9 @@
     ul#notes { list-style: none; padding: 0; }
     ul#notes li { padding: 0.4rem 0; border-bottom: 1px solid #eee; }
     .meta { color: #888; font-size: 0.8em; }
+    .trust-known { color: #070; font-weight: bold; }
+    .trust-own { color: #555; font-style: italic; }
+    .trust-unknown { color: #a00; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -33,6 +36,9 @@
     <textarea id="my-card" rows="3" readonly></textarea>
 
     <h2>Add a peer</h2>
+    <p>Pinning a label trusts it on first use - re-pinning the same label with a
+       different key is rejected, never silently overwritten. One peer per identity.</p>
+    <input id="peer-label" type="text" placeholder="Label (e.g. Mom)" />
     <textarea id="peer-card" rows="3" placeholder="Paste your peer's card here"></textarea>
     <button id="add-peer-btn">Add peer</button>
 

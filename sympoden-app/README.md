@@ -73,11 +73,28 @@ cargo tauri dev
    `SYMPODEN_DATA_DIR=/tmp/bob-app cargo tauri dev`. (Without this override the app
    uses the OS app-data directory, which is what a real install should leave it at.)
 3. In each window: create an identity, copy the "Your card" value into the *other*
-   window's "Add a peer" box and click "Add peer".
+   window's "Add a peer" box, give it a label (e.g. "alice"/"bob"), and click "Add
+   peer". (Slice 02: this pins the peer's key under that label - re-pinning the same
+   label with a different key is rejected, and only one peer can be configured per
+   identity this slice.)
 4. In Alice's window: write a note, click "Post", then click "Sync now". Close her
    window entirely.
 5. In Bob's window (already running, or launched fresh later): click "Sync now" —
-   Alice's note should appear in the list.
+   Alice's note should appear in the list, labeled "alice" (not a raw key) since Bob
+   pinned her in step 3.
+
+## Slice 02 GUI status
+
+The JSON shape `list_notes`/`sync_now` now return (`{note, trust}`, with `trust` one of
+`"Own"`/`"Unknown"`/`{"Known": "<label>"}`) was verified against the actual serializer
+output (not assumed), and `ui/main.js` was updated to match and render each case
+distinctly (a known peer's label, "you" for own notes, and an unmistakable `⚠ unknown
+sender` warning otherwise - never just the absence of a label). What this crate's own
+test suite and that verification do *not* cover is the same residual risk Slice 01
+already named: actually clicking through the updated GUI on a real desktop with a
+display server. That two-instance walkthrough (steps 1-5 above, now exercising the
+label field and the Known/Unknown labeling) has **not yet** been performed and should
+be done before calling Slice 02's UI "done," not just its engine/CLI layer.
 
 ## Known limitation: "handed to the relay" is not "delivered"
 
