@@ -8,3 +8,4 @@ pub mod identity;
 mod kdf;
 pub mod store;
 pub mod sync;
+pub mod trust;
