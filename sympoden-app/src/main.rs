@@ -24,12 +24,12 @@ use thiserror::Error;
 use sympoden_engine::content::Note;
 use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError};
 use sympoden_engine::identity::{Identity, PublicCard};
-use sympoden_engine::store::{Store, StoredNote};
+use sympoden_engine::store::Store;
 use sympoden_engine::sync::{self, RelayClient};
+use sympoden_engine::trust::{self, TrustedNote};
 
 const KEYFILE_NAME: &str = "identity.keyfile.json";
 const DB_NAME: &str = "notes.sqlite";
-const PEER_NAME: &str = "peer.json";
 
 /// Everything that exists only while the identity is unlocked: the signing/key-
 /// agreement keys and the open database. Dropped (and zeroized, for the key
@@ -76,10 +76,6 @@ fn db_path(dir: &Path) -> PathBuf {
     dir.join(DB_NAME)
 }
 
-fn peer_path(dir: &Path) -> PathBuf {
-    dir.join(PEER_NAME)
-}
-
 fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -113,23 +109,21 @@ fn whoami_card(session: &Session) -> PublicCard {
     session.identity.public_card()
 }
 
-fn add_peer_card(dir: &Path, card: &str) -> Result<(), AppError> {
+/// Pin a peer's card under `label` in the encrypted store. Requires an unlocked
+/// `Session` (the store needs `db_key`) - peer labels are user-created data and now
+/// live encrypted at rest like everything else, not in a plaintext file.
+fn add_peer_card(session: &Session, label: &str, card: &str) -> Result<(), AppError> {
     let parsed: PublicCard =
         serde_json::from_str(card).map_err(|e| AppError::InvalidCard(e.to_string()))?;
 
-    // Validate the card actually parses into real keys before saving it.
-    parsed.ed25519_verifying_key()?;
-    parsed.x25519_public_key()?;
+    // Validate the card actually parses into real keys before pinning it.
+    let ed25519_pubkey = hex::encode(parsed.ed25519_verifying_key()?.as_bytes());
+    let x25519_pubkey = hex::encode(parsed.x25519_public_key()?.to_bytes());
 
-    let serialized =
-        serde_json::to_vec_pretty(&parsed).map_err(|e| AppError::InvalidCard(e.to_string()))?;
-    std::fs::write(peer_path(dir), serialized)?;
+    session
+        .store
+        .add_peer(label, &ed25519_pubkey, &x25519_pubkey, now_unix())?;
     Ok(())
-}
-
-fn load_peer(dir: &Path) -> Option<PublicCard> {
-    let raw = std::fs::read(peer_path(dir)).ok()?;
-    serde_json::from_slice(&raw).ok()
 }
 
 fn post_note_now(session: &Session, body: String, created_at: i64) -> Result<String, AppError> {
@@ -141,19 +135,22 @@ fn post_note_now(session: &Session, body: String, created_at: i64) -> Result<Str
 #[derive(Serialize)]
 struct SyncResult {
     pushed: Vec<String>,
-    received: Option<StoredNote>,
+    received: Option<TrustedNote>,
 }
 
-fn sync_now_inner(session: &Session, dir: &Path, relay: String) -> Result<SyncResult, AppError> {
+fn sync_now_inner(session: &Session, relay: String) -> Result<SyncResult, AppError> {
     let client = RelayClient::new(relay);
+    let peers = session.store.list_peers()?;
+    let my_key = session.identity.signing_key.verifying_key();
 
     let mut pushed = Vec::new();
-    if let Some(peer) = load_peer(dir) {
-        let my_pubkey_hex = hex::encode(session.identity.signing_key.verifying_key().as_bytes());
+    if let Some(peer) = peers.first() {
+        let card = PublicCard::from_pinned_peer(peer)?;
+        let my_pubkey_hex = hex::encode(my_key.as_bytes());
         let pending = session.store.unsynced_own_notes(&my_pubkey_hex)?;
         for stored in pending {
             let note = Note::from_stored(&stored)?;
-            let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &peer)?;
+            let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &card)?;
             match client.push(&routing_key, &envelope_bytes)? {
                 sync::PushOutcome::Accepted => {
                     session.store.mark_synced(&stored.id, now_unix())?;
@@ -169,14 +166,13 @@ fn sync_now_inner(session: &Session, dir: &Path, relay: String) -> Result<SyncRe
         }
     }
 
-    let my_routing_key =
-        sympoden_engine::crypto::routing_key_for(&session.identity.signing_key.verifying_key());
+    let my_routing_key = sympoden_engine::crypto::routing_key_for(&my_key);
     let received = match client.pull(&my_routing_key)? {
         Some(envelope_bytes) => {
             let note = sync::receive_incoming(&envelope_bytes, &session.identity.x25519_secret)?;
-            let stored = note.to_stored();
-            session.store.insert_note(&stored)?;
-            Some(stored)
+            let trusted = trust::classify_stored_note(note.to_stored(), &my_key, &peers)?;
+            session.store.insert_note(trusted.note())?;
+            Some(trusted)
         }
         None => None,
     };
@@ -184,8 +180,16 @@ fn sync_now_inner(session: &Session, dir: &Path, relay: String) -> Result<SyncRe
     Ok(SyncResult { pushed, received })
 }
 
-fn list_notes_inner(session: &Session) -> Result<Vec<StoredNote>, AppError> {
-    Ok(session.store.list_notes()?)
+fn list_notes_inner(session: &Session) -> Result<Vec<TrustedNote>, AppError> {
+    let peers = session.store.list_peers()?;
+    let my_key = session.identity.signing_key.verifying_key();
+
+    session
+        .store
+        .list_notes()?
+        .into_iter()
+        .map(|note| trust::classify_stored_note(note, &my_key, &peers).map_err(AppError::from))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------
@@ -230,8 +234,13 @@ fn whoami(state: State<AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn add_peer(state: State<AppState>, card: String) -> Result<(), String> {
-    add_peer_card(&state.data_dir, &card).map_err(|e| e.to_string())
+fn add_peer(state: State<AppState>, label: String, card: String) -> Result<(), String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "internal error".to_string())?;
+    let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
+    add_peer_card(session, &label, &card).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -251,11 +260,11 @@ fn sync_now(state: State<AppState>, relay: String) -> Result<SyncResult, String>
         .lock()
         .map_err(|_| "internal error".to_string())?;
     let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
-    sync_now_inner(session, &state.data_dir, relay).map_err(|e| e.to_string())
+    sync_now_inner(session, relay).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn list_notes(state: State<AppState>) -> Result<Vec<StoredNote>, String> {
+fn list_notes(state: State<AppState>) -> Result<Vec<TrustedNote>, String> {
     let guard = state
         .session
         .lock()
@@ -350,10 +359,11 @@ mod tests {
         assert_eq!(card_keys, expected_card_keys);
 
         // post_note -> a content-addressed id (String), then list_notes ->
-        // Vec<StoredNote>: id/author_pubkey/body/created_at/signature/synced_at. The
-        // body is the one piece of plaintext a command is meant to surface - the
-        // user's own note, read back to them. Nothing else is secret: the pubkey and
-        // signature are public verification data, not key material.
+        // Vec<TrustedNote>: {note: {id/author_pubkey/body/created_at/signature/
+        // synced_at}, trust: ...}. The body is the one piece of plaintext a command
+        // is meant to surface - the user's own note, read back to them. Nothing else
+        // is secret: the pubkey, signature, and trust label are public/local-judgment
+        // data, not key material.
         let secret_body = "only the body should ever leave the process";
         post_note_now(&session, secret_body.to_string(), 1_700_000_000).unwrap();
         let notes = list_notes_inner(&session).unwrap();
@@ -364,12 +374,23 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
+            ["note", "trust"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        let inner = note_obj["note"].as_object().unwrap();
+        assert_eq!(
+            inner
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
             ["id", "author_pubkey", "body", "created_at", "signature", "synced_at"]
                 .into_iter()
                 .map(String::from)
                 .collect()
         );
-        assert_eq!(note_obj["body"], secret_body);
+        assert_eq!(inner["body"], secret_body);
     }
 
     #[test]
@@ -430,8 +451,31 @@ mod tests {
     #[test]
     fn add_peer_rejects_a_malformed_card_cleanly() {
         let dir = tempdir().unwrap();
-        let result = add_peer_card(dir.path(), "not json at all");
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let result = add_peer_card(&session, "bob", "not json at all");
         assert!(matches!(result, Err(AppError::InvalidCard(_))));
+    }
+
+    #[test]
+    fn add_peer_rejects_a_second_distinct_label() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        let carol_dir = dir.path().join("carol");
+        fs::create_dir_all(&bob_dir).unwrap();
+        fs::create_dir_all(&carol_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let carol = create_identity_session(&carol_dir, "carol-pass").unwrap();
+
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let carol_card = serde_json::to_string(&whoami_card(&carol)).unwrap();
+        add_peer_card(&session, "bob", &bob_card).unwrap();
+
+        let result = add_peer_card(&session, "carol", &carol_card);
+        assert!(matches!(
+            result,
+            Err(AppError::Store(StoreError::PeerAlreadyConfigured { .. }))
+        ));
     }
 
     #[test]
@@ -443,7 +487,22 @@ mod tests {
         let notes = list_notes_inner(&session).unwrap();
 
         assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].body, "hello, world");
+        assert_eq!(notes[0].note().body, "hello, world");
+    }
+
+    // AC11: the user's own posted note must classify as Own ("you"), never Unknown -
+    // its author_pubkey is this identity's own key, which never needs to (and must
+    // not need to) appear in the peers table.
+    #[test]
+    fn own_posted_note_classifies_as_own_not_unknown() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+
+        post_note_now(&session, "hello, world".to_string(), 1_700_000_000).unwrap();
+        let notes = list_notes_inner(&session).unwrap();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(*notes[0].trust(), sympoden_engine::trust::AuthorTrust::Own);
     }
 
     /// A real, in-process relay: a live TCP listener backed by a shared `HashMap`
@@ -571,7 +630,12 @@ mod tests {
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
 
         let bob_card_json = serde_json::to_string(&whoami_card(&bob)).unwrap();
-        add_peer_card(&alice_dir, &bob_card_json).unwrap();
+        add_peer_card(&alice, "bob", &bob_card_json).unwrap();
+        // Bob also pins Alice, so the note that flows (Alice -> Bob) classifies as
+        // Known on Bob's side, not Unknown - without this, the test would never
+        // exercise SLICE-02's actual headline property.
+        let alice_card_json = serde_json::to_string(&whoami_card(&alice)).unwrap();
+        add_peer_card(&bob, "alice", &alice_card_json).unwrap();
 
         let body = "hello bob, from a headless two-session test".to_string();
         post_note_now(&alice, body.clone(), 1_700_000_000).unwrap();
@@ -580,18 +644,23 @@ mod tests {
 
         // Alice pushes to the relay, then (in spirit) goes fully offline - nothing
         // about her session is touched again in this test.
-        let alice_sync = sync_now_inner(&alice, &alice_dir, relay_addr.to_string()).unwrap();
+        let alice_sync = sync_now_inner(&alice, relay_addr.to_string()).unwrap();
         assert_eq!(alice_sync.pushed.len(), 1);
         assert!(alice_sync.received.is_none());
 
-        // Bob syncs later and should see Alice's note arrive, verified and decrypted.
-        let bob_sync = sync_now_inner(&bob, &bob_dir, relay_addr.to_string()).unwrap();
+        // Bob syncs later and should see Alice's note arrive, verified, decrypted,
+        // and bound to her pinned label - not a raw key.
+        let bob_sync = sync_now_inner(&bob, relay_addr.to_string()).unwrap();
         let received = bob_sync
             .received
             .expect("bob should have received alice's note from the relay");
-        assert_eq!(received.body, body);
+        assert_eq!(received.note().body, body);
+        assert_eq!(
+            *received.trust(),
+            sympoden_engine::trust::AuthorTrust::Known("alice".to_string())
+        );
 
         let bob_notes = list_notes_inner(&bob).unwrap();
-        assert!(bob_notes.iter().any(|n| n.body == body));
+        assert!(bob_notes.iter().any(|n| n.note().body == body));
     }
 }
