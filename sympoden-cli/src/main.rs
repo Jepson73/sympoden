@@ -16,10 +16,10 @@ use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError}
 use sympoden_engine::identity::{Identity, PublicCard};
 use sympoden_engine::store::Store;
 use sympoden_engine::sync::{self, RelayClient};
+use sympoden_engine::trust::{self, AuthorTrust};
 
 const KEYFILE_NAME: &str = "identity.keyfile.json";
 const DB_NAME: &str = "notes.sqlite";
-const PEER_NAME: &str = "peer.json";
 
 #[derive(Parser)]
 #[command(name = "sympoden-cli", about = "Slice 01 CLI harness")]
@@ -38,8 +38,11 @@ enum Command {
     Init,
     /// Print this identity's public card, to share with a peer out-of-band.
     Whoami,
-    /// Save a peer's public card (as printed by their `whoami`).
-    AddPeer { card: String },
+    /// Pin a peer's public card (as printed by their `whoami`) under a local label.
+    /// Trust-on-first-use: a second, different label is rejected (one peer per
+    /// identity this slice), and re-adding the same label with a different key is
+    /// rejected too - re-pinning is never silent.
+    AddPeer { label: String, card: String },
     /// Write and sign a new note, stored locally.
     Post { body: String },
     /// Push any unsynced notes to the relay, then pull anything waiting for us.
@@ -65,8 +68,6 @@ enum CliError {
     Io(#[from] std::io::Error),
     #[error("invalid peer card: {0}")]
     InvalidCard(String),
-    #[error("no peer configured - run add-peer first")]
-    NoPeer,
     #[error("passphrases did not match")]
     PassphraseMismatch,
 }
@@ -86,7 +87,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Init => cmd_init(&cli.data_dir),
         Command::Whoami => cmd_whoami(&cli.data_dir),
-        Command::AddPeer { card } => cmd_add_peer(&cli.data_dir, &card),
+        Command::AddPeer { label, card } => cmd_add_peer(&cli.data_dir, &label, &card),
         Command::Post { body } => cmd_post(&cli.data_dir, body),
         Command::Sync { relay } => cmd_sync(&cli.data_dir, &relay),
         Command::List => cmd_list(&cli.data_dir),
@@ -99,10 +100,6 @@ fn keyfile_path(dir: &Path) -> PathBuf {
 
 fn db_path(dir: &Path) -> PathBuf {
     dir.join(DB_NAME)
-}
-
-fn peer_path(dir: &Path) -> PathBuf {
-    dir.join(PEER_NAME)
 }
 
 /// Prompt for a passphrase, hidden, via the controlling TTY. When there is no TTY
@@ -151,28 +148,24 @@ fn cmd_whoami(dir: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_add_peer(dir: &Path, card: &str) -> Result<(), CliError> {
+fn cmd_add_peer(dir: &Path, label: &str, card: &str) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let store = Store::open(&db_path(dir), &identity.db_key)?;
+
     let decoded = BASE64
         .decode(card.trim())
         .map_err(|e| CliError::InvalidCard(e.to_string()))?;
     let parsed: PublicCard =
         serde_json::from_slice(&decoded).map_err(|e| CliError::InvalidCard(e.to_string()))?;
 
-    // Validate the card actually parses into real keys before saving it.
-    parsed.ed25519_verifying_key()?;
-    parsed.x25519_public_key()?;
+    // Validate the card actually parses into real keys before pinning it.
+    let ed25519_pubkey = hex::encode(parsed.ed25519_verifying_key()?.as_bytes());
+    let x25519_pubkey = hex::encode(parsed.x25519_public_key()?.to_bytes());
 
-    let serialized =
-        serde_json::to_vec_pretty(&parsed).map_err(|e| CliError::InvalidCard(e.to_string()))?;
-    fs::write(peer_path(dir), serialized)?;
+    store.add_peer(label, &ed25519_pubkey, &x25519_pubkey, now_unix())?;
 
-    println!("Peer added.");
+    println!("Peer \"{label}\" pinned.");
     Ok(())
-}
-
-fn load_peer(dir: &Path) -> Result<PublicCard, CliError> {
-    let raw = fs::read(peer_path(dir)).map_err(|_| CliError::NoPeer)?;
-    serde_json::from_slice(&raw).map_err(|e| CliError::InvalidCard(e.to_string()))
 }
 
 fn cmd_post(dir: &Path, body: String) -> Result<(), CliError> {
@@ -190,12 +183,14 @@ fn cmd_sync(dir: &Path, relay_addr: &str) -> Result<(), CliError> {
     let identity = unlock(dir)?;
     let store = Store::open(&db_path(dir), &identity.db_key)?;
     let client = RelayClient::new(relay_addr.to_string());
+    let peers = store.list_peers()?;
 
-    if let Ok(peer) = load_peer(dir) {
+    if let Some(peer) = peers.first() {
+        let card = PublicCard::from_pinned_peer(peer)?;
         let my_pubkey_hex = hex::encode(identity.signing_key.verifying_key().as_bytes());
         for stored in store.unsynced_own_notes(&my_pubkey_hex)? {
             let note = Note::from_stored(&stored)?;
-            let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &peer)?;
+            let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &card)?;
             match client.push(&routing_key, &envelope_bytes)? {
                 sync::PushOutcome::Accepted => {
                     store.mark_synced(&stored.id, now_unix())?;
@@ -229,12 +224,17 @@ fn cmd_sync(dir: &Path, relay_addr: &str) -> Result<(), CliError> {
     match client.pull(&my_routing_key)? {
         Some(envelope_bytes) => {
             let note = sync::receive_incoming(&envelope_bytes, &identity.x25519_secret)?;
+            let trusted = trust::classify_stored_note(
+                note.to_stored(),
+                &identity.signing_key.verifying_key(),
+                &peers,
+            )?;
             println!(
                 "Received note from {}: {}",
-                hex::encode(note.author_pubkey.as_bytes()),
-                note.body
+                trust_label(trusted.trust()),
+                trusted.note().body
             );
-            store.insert_note(&note.to_stored())?;
+            store.insert_note(trusted.note())?;
         }
         None => println!("Nothing new from the relay."),
     }
@@ -245,17 +245,31 @@ fn cmd_sync(dir: &Path, relay_addr: &str) -> Result<(), CliError> {
 fn cmd_list(dir: &Path) -> Result<(), CliError> {
     let identity = unlock(dir)?;
     let store = Store::open(&db_path(dir), &identity.db_key)?;
+    let peers = store.list_peers()?;
+    let my_key = identity.signing_key.verifying_key();
 
     for note in store.list_notes()? {
+        let trusted = trust::classify_stored_note(note, &my_key, &peers)?;
         println!(
             "[{}] {} ({}): {}",
-            note.created_at,
-            &note.id[..8.min(note.id.len())],
-            &note.author_pubkey[..8.min(note.author_pubkey.len())],
-            note.body
+            trusted.note().created_at,
+            &trusted.note().id[..8.min(trusted.note().id.len())],
+            trust_label(trusted.trust()),
+            trusted.note().body
         );
     }
     Ok(())
+}
+
+/// How a trust classification reads in plain text output. The unknown case is
+/// prefixed distinctly (`⚠`) so it cannot be mistaken for a known peer's label at a
+/// glance - that distinctness is the security point of this slice (SLICE-02 D3).
+fn trust_label(trust: &AuthorTrust) -> String {
+    match trust {
+        AuthorTrust::Own => "you".to_string(),
+        AuthorTrust::Known(label) => label.clone(),
+        AuthorTrust::Unknown => "⚠ unknown sender".to_string(),
+    }
 }
 
 fn now_unix() -> i64 {
