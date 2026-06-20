@@ -243,6 +243,20 @@ the peers-table lookup.
     trust-annotated wrapper, so omitting classification before display is a compile error,
     not a possible bug.
 
+**Status:** code-complete and headless-verified — `cargo test --workspace` and
+`cargo clippy --workspace --all-targets -- -D warnings` are clean across every crate
+(engine, cli, relay, app), and the extended `scripts/demo.sh` demonstrates AC1-AC10
+end to end against a live relay (known-peer binding, unknown-sender labeling,
+recompute-at-display after pinning, the single-peer cap, rejected re-pin, and
+idempotent re-add), plus all of Slice 01's original criteria unchanged. AC11 (own-note
+`Own` classification) and AC12 (no bare-`StoredNote` display path) are covered by
+engine/app unit tests. The app's webview frontend (`ui/main.js`, `ui/index.html`) was
+updated for the new `{note, trust}` IPC shape and that shape was checked against the
+real serializer output (not assumed), but the actual two-instance GUI click-through on
+a real desktop has **not yet** been performed — see `sympoden-app/README.md`'s
+"Slice 02 GUI status" section. That manual step, not anything in this codebase, is
+what's left before this slice's UI can be called fully done.
+
 ## Explicit NON-GOALS (do not build these in Slice 02)
 
 Out-of-band key verification (safety numbers / QR fingerprint comparison) · revocation of
