@@ -302,6 +302,20 @@ impl Identity {
 }
 
 impl PublicCard {
+    /// Reconstruct the sendable card for a pinned peer, decoding the hex keys the
+    /// `peers` table stores (matching `StoredNote::author_pubkey`'s encoding) back
+    /// into the base64 a `PublicCard` carries.
+    pub fn from_pinned_peer(peer: &crate::store::PinnedPeer) -> Result<Self, IdentityError> {
+        let ed_bytes = hex::decode(&peer.ed25519_pubkey)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        let x_bytes = hex::decode(&peer.x25519_pubkey)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        Ok(Self {
+            ed25519_public: BASE64.encode(ed_bytes),
+            x25519_public: BASE64.encode(x_bytes),
+        })
+    }
+
     pub fn ed25519_verifying_key(&self) -> Result<VerifyingKey, IdentityError> {
         let bytes = BASE64
             .decode(&self.ed25519_public)
@@ -408,6 +422,32 @@ mod tests {
         assert_eq!(
             card.x25519_public_key().unwrap().to_bytes(),
             X25519PublicKey::from(&identity.x25519_secret).to_bytes()
+        );
+    }
+
+    #[test]
+    fn from_pinned_peer_round_trips_a_card_through_the_hex_pin_encoding() {
+        use crate::store::PinnedPeer;
+
+        let dir = tempdir().unwrap();
+        let bob = Identity::create(&dir.path().join("bob.json"), "bob-pass").unwrap();
+        let card = bob.public_card();
+
+        let pinned = PinnedPeer {
+            label: "bob".to_string(),
+            ed25519_pubkey: hex::encode(card.ed25519_verifying_key().unwrap().as_bytes()),
+            x25519_pubkey: hex::encode(card.x25519_public_key().unwrap().to_bytes()),
+            first_seen: 1_700_000_000,
+        };
+
+        let reconstructed = PublicCard::from_pinned_peer(&pinned).unwrap();
+        assert_eq!(
+            reconstructed.ed25519_verifying_key().unwrap(),
+            bob.signing_key.verifying_key()
+        );
+        assert_eq!(
+            reconstructed.x25519_public_key().unwrap().to_bytes(),
+            X25519PublicKey::from(&bob.x25519_secret).to_bytes()
         );
     }
 
