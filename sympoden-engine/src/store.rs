@@ -1,9 +1,14 @@
-//! Local encrypted store: SQLite + SQLCipher, one `notes` table.
+//! Local encrypted store: SQLite + SQLCipher, a `notes` table and a `peers` table.
 //!
-//! The schema is exactly the table Slice 01 specifies — `(id, author_pubkey, body,
-//! created_at, signature)` — plus one bookkeeping column, `synced_at`, needed to avoid
-//! re-pushing a note that's already on the relay. Incoming notes are deduplicated by
-//! their content-addressed `id` instead.
+//! The `notes` schema is exactly the table Slice 01 specifies — `(id, author_pubkey,
+//! body, created_at, signature)` — plus one bookkeeping column, `synced_at`, needed to
+//! avoid re-pushing a note that's already on the relay. Incoming notes are deduplicated
+//! by their content-addressed `id` instead.
+//!
+//! The `peers` table (Slice 02) holds trust-on-first-use pins: a label and the two
+//! pinned public keys (hex, matching `notes.author_pubkey`'s encoding) plus a first-seen
+//! timestamp. It is schema-shaped to hold a set, but Slice 02 enforces at most one row
+//! at a time (see `add_peer`) — see `docs/slices/SLICE-02.md` D2 for why.
 
 use std::path::Path;
 
@@ -25,6 +30,18 @@ pub struct StoredNote {
     pub created_at: i64,   // unix seconds
     pub signature: String, // hex Ed25519 signature
     pub synced_at: Option<i64>,
+}
+
+/// A trust-on-first-use pin: a local label bound to the two public keys from a peer's
+/// card, plus when it was first pinned. Both keys are hex, matching `StoredNote`'s
+/// `author_pubkey` encoding, so comparing a note's author against a pin is a plain
+/// string (or decoded-byte) comparison with no encoding mismatch to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedPeer {
+    pub label: String,
+    pub ed25519_pubkey: String, // hex
+    pub x25519_pubkey: String,  // hex
+    pub first_seen: i64,        // unix seconds
 }
 
 impl Store {
@@ -55,6 +72,12 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 signature TEXT NOT NULL,
                 synced_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS peers (
+                label TEXT PRIMARY KEY,
+                ed25519_pubkey TEXT NOT NULL,
+                x25519_pubkey TEXT NOT NULL,
+                first_seen INTEGER NOT NULL
             );",
         )?;
 
@@ -125,6 +148,63 @@ impl Store {
             signature: row.get(4)?,
             synced_at: row.get(5)?,
         })
+    }
+
+    /// Pin `label` to the given keys. Trust-on-first-use: succeeds and persists the pin
+    /// if `label` is new (and no other peer is configured - this slice enforces a single
+    /// correspondent, see SLICE-02 D2); is a no-op success if `label` already exists with
+    /// these exact keys; and is rejected with a typed error - never a silent overwrite -
+    /// if `label` exists with *different* keys, or if a *different* label is already
+    /// configured.
+    pub fn add_peer(
+        &self,
+        label: &str,
+        ed25519_pubkey: &str,
+        x25519_pubkey: &str,
+        first_seen: i64,
+    ) -> Result<(), StoreError> {
+        let existing = self.list_peers()?;
+
+        if let Some(peer) = existing.iter().find(|p| p.label == label) {
+            if peer.ed25519_pubkey == ed25519_pubkey && peer.x25519_pubkey == x25519_pubkey {
+                return Ok(());
+            }
+            return Err(StoreError::PeerKeyMismatch {
+                label: label.to_string(),
+            });
+        }
+
+        if let Some(other) = existing.first() {
+            return Err(StoreError::PeerAlreadyConfigured {
+                existing_label: other.label.clone(),
+            });
+        }
+
+        self.conn.execute(
+            "INSERT INTO peers (label, ed25519_pubkey, x25519_pubkey, first_seen)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![label, ed25519_pubkey, x25519_pubkey, first_seen],
+        )?;
+        Ok(())
+    }
+
+    /// All pinned peers. Typed as a `Vec` (rather than `Option<PinnedPeer>`) so the
+    /// shape survives Phase 1's real multi-peer work without a second migration, even
+    /// though this slice's `add_peer` enforces at most one row.
+    pub fn list_peers(&self) -> Result<Vec<PinnedPeer>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT label, ed25519_pubkey, x25519_pubkey, first_seen FROM peers
+             ORDER BY first_seen ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PinnedPeer {
+                label: row.get(0)?,
+                ed25519_pubkey: row.get(1)?,
+                x25519_pubkey: row.get(2)?,
+                first_seen: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 }
 
@@ -254,5 +334,71 @@ mod tests {
         let raw = std::fs::read(&path).unwrap();
         let raw_str = String::from_utf8_lossy(&raw);
         assert!(!raw_str.contains(secret_body));
+    }
+
+    #[test]
+    fn add_peer_then_list_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        let peers = store.list_peers().unwrap();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].label, "bob");
+        assert_eq!(peers[0].ed25519_pubkey, "ed-bob");
+        assert_eq!(peers[0].x25519_pubkey, "x-bob");
+    }
+
+    #[test]
+    fn add_peer_is_idempotent_on_identical_resubmission() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_500).unwrap();
+
+        assert_eq!(store.list_peers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_peer_rejects_a_changed_key_under_the_same_label() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        let result = store.add_peer("bob", "ed-bob-NEW", "x-bob", 1_700_000_500);
+
+        assert!(matches!(
+            result,
+            Err(StoreError::PeerKeyMismatch { label }) if label == "bob"
+        ));
+        // The original pin must survive a rejected re-pin attempt untouched.
+        let peers = store.list_peers().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].ed25519_pubkey, "ed-bob");
+    }
+
+    #[test]
+    fn add_peer_rejects_a_second_distinct_label() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        let result = store.add_peer("carol", "ed-carol", "x-carol", 1_700_000_500);
+
+        assert!(matches!(
+            result,
+            Err(StoreError::PeerAlreadyConfigured { existing_label }) if existing_label == "bob"
+        ));
+        assert_eq!(store.list_peers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_peers_is_empty_before_any_peer_is_added() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        assert_eq!(store.list_peers().unwrap(), Vec::new());
     }
 }

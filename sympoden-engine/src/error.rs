@@ -33,6 +33,14 @@ pub enum StoreError {
     InvalidKey,
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error(
+        "a peer is already configured as \"{existing_label}\" - this slice supports only one peer"
+    )]
+    PeerAlreadyConfigured { existing_label: String },
+    #[error(
+        "\"{label}\" is already pinned to a different key - refusing to silently re-pin"
+    )]
+    PeerKeyMismatch { label: String },
 }
 
 /// Errors from the `content` module: parsing/validating a note's wire format.
