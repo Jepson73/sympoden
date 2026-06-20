@@ -100,6 +100,4 @@ d. **Criterion 4 ("no hidden network calls") is partially evidenced, not proven.
 
 ## Invariant check for this slice
 
-No personal data (keyfile only) ✓ · no ads/engine ✓ · relay is blind and stateless-ish
-(encrypted, expiring) ✓ · no content inspection ✓ · verifiable/no-telemetry build ✓ ·
-honest scope ✓. If any added feature would break one of these, stop and surface it.
+No personal data (keyfile only) ✓ · no ads/engine ✓ · relay is blind and stateless-ish (encrypted, expiring) ✓ · no content inspection ✓ · verifiable/no-telemetry build ✓ · honest scope ✓ · vetted crypto crates only, secrets zeroized ✓ · facts/opinions structurally distinct — N/A this slice (single note type, no claims/corrections). If any added feature would break one of these, stop and surface it.
