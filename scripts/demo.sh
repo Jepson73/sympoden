@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Slice 01 end-to-end acceptance demo.
+# Slice 01 + Slice 02 end-to-end acceptance demo.
 #
-# Alice creates an identity, posts a signed note, pushes it to a blind relay, and
-# goes fully offline. Later, Bob - a separate process, never running at the same
-# time as Alice's - syncs, pulls the blob, decrypts it, verifies Alice's signature,
-# and displays the note. See docs/slices/SLICE-01.md for the acceptance criteria
-# this demonstrates.
+# Slice 01: Alice creates an identity, posts a signed note, pushes it to a blind
+# relay, and goes fully offline. Later, Bob - a separate process, never running at
+# the same time as Alice's - syncs, pulls the blob, decrypts it, verifies Alice's
+# signature, and displays the note. See docs/slices/SLICE-01.md.
+#
+# Slice 02 (TOFU): the same exchange, but now checking *who* Bob believes sent it.
+# Bob receives Alice's first note before pinning her (Unknown), pins her, and the
+# same note reclassifies as Known on the next listing (AC8's recompute-at-display).
+# A third identity (Carol) who Bob never pins stays Unknown forever - Bob's
+# single-peer cap means he can't pin her even if he tried, which this script also
+# checks, along with a rejected re-pin (same label, different key) and an idempotent
+# re-add (same label, same key). See docs/slices/SLICE-02.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -59,28 +66,46 @@ printf 'alice-pass\nalice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" init >/dev/nu
 echo "==> Bob: init"
 printf 'bob-pass\nbob-pass\n' | "$CLI" --data-dir "$BOB_DIR" init >/dev/null
 
+ALICE_CARD=$(printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" whoami)
 BOB_CARD=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" whoami)
 
 echo "==> Alice: add Bob as a peer, post a note, push it, then go fully offline"
-printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" add-peer "$BOB_CARD" >/dev/null
+printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" add-peer bob "$BOB_CARD" >/dev/null
 printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" post "$NOTE_BODY" >/dev/null
 printf 'alice-pass\n' | "$CLI" --data-dir "$ALICE_DIR" sync --relay "$RELAY_ADDR" >/dev/null
 # Alice's process tree ends here. Nothing of hers stays running while Bob syncs.
 
-echo "==> Bob: sync later and check the note arrived"
+echo "==> Bob: sync later (before pinning Alice) and check the note arrived as unknown"
 SYNC_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" sync --relay "$RELAY_ADDR")
 if ! echo "$SYNC_OUTPUT" | grep -qF "$NOTE_BODY"; then
     echo "FAIL: Bob did not receive Alice's note"
     exit 1
 fi
-echo "OK: Bob received and verified Alice's note via sync"
-
-LIST_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list)
-if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY"; then
-    echo "FAIL: note missing from Bob's local list"
+if ! echo "$SYNC_OUTPUT" | grep -qi "unknown sender"; then
+    echo "FAIL: expected the note to show as an unknown sender before Bob pins Alice"
     exit 1
 fi
-echo "OK: note appears in Bob's local list"
+echo "OK: Bob received and verified Alice's note via sync, shown as unknown (not yet pinned)"
+
+LIST_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list)
+if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY" || ! echo "$LIST_OUTPUT" | grep -qi "unknown sender"; then
+    echo "FAIL: note missing from Bob's local list, or not shown as unknown"
+    exit 1
+fi
+echo "OK: note appears in Bob's local list, shown as unknown sender (SLICE-02 AC2)"
+
+echo "==> Bob: pin Alice, then re-list - the same note should reclassify as known"
+printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$ALICE_CARD" >/dev/null
+LIST_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list)
+if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY" || ! echo "$LIST_OUTPUT" | grep -q "(alice):"; then
+    echo "FAIL: expected Alice's note to now show under her pinned label \"alice\""
+    exit 1
+fi
+if echo "$LIST_OUTPUT" | grep -qi "unknown sender"; then
+    echo "FAIL: Alice's note still shows as unknown after pinning her - recompute-at-display is broken"
+    exit 1
+fi
+echo "OK: the same note reclassified from unknown to known on the next listing (SLICE-02 AC1, AC8)"
 
 echo "==> Alice: post two notes before Bob picks up the first (no data loss)"
 FIRST_BODY="first note - $(date +%s)"
@@ -102,6 +127,54 @@ if ! echo "$BOB_NOTES" | grep -qF "$FIRST_BODY" || ! echo "$BOB_NOTES" | grep -q
 fi
 echo "OK: both notes arrived - posting ahead of a sync never silently loses one"
 
+CAROL_DIR="$WORKDIR/carol"
+STRANGER_BODY="hello from a stranger bob never pinned - $(date +%s)"
+
+echo "==> Carol (a stranger Bob never pins): post to Bob, who already has Alice pinned"
+printf 'carol-pass\ncarol-pass\n' | "$CLI" --data-dir "$CAROL_DIR" init >/dev/null
+CAROL_CARD=$(printf 'carol-pass\n' | "$CLI" --data-dir "$CAROL_DIR" whoami)
+printf 'carol-pass\n' | "$CLI" --data-dir "$CAROL_DIR" add-peer bob "$BOB_CARD" >/dev/null
+printf 'carol-pass\n' | "$CLI" --data-dir "$CAROL_DIR" post "$STRANGER_BODY" >/dev/null
+printf 'carol-pass\n' | "$CLI" --data-dir "$CAROL_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+
+SYNC_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$SYNC_OUTPUT" | grep -qF "$STRANGER_BODY" || ! echo "$SYNC_OUTPUT" | grep -qi "unknown sender"; then
+    echo "FAIL: expected Carol's note to arrive and show as an unknown sender"
+    exit 1
+fi
+echo "OK: Carol's note arrived, shown as unknown sender - a stranger Bob never pinned"
+
+echo "==> Bob: a second distinct label is rejected (single-peer cap, SLICE-02 D2/AC6)"
+set +e
+CAP_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer carol "$CAROL_CARD" 2>&1)
+CAP_STATUS=$?
+set -e
+if [ "$CAP_STATUS" -eq 0 ] || ! echo "$CAP_OUTPUT" | grep -qi "already configured"; then
+    echo "FAIL: expected adding a second distinct peer to be rejected, got: $CAP_OUTPUT"
+    exit 1
+fi
+echo "OK: a second distinct peer is rejected - Carol can never be pinned while Alice is, so her note stays unknown forever"
+
+echo "==> Bob: re-pinning \"alice\" with a different key is rejected, the working pin survives (AC5)"
+set +e
+REPIN_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$CAROL_CARD" 2>&1)
+REPIN_STATUS=$?
+set -e
+if [ "$REPIN_STATUS" -eq 0 ] || ! echo "$REPIN_OUTPUT" | grep -qi "different key"; then
+    echo "FAIL: expected re-pinning \"alice\" to a different key to be rejected, got: $REPIN_OUTPUT"
+    exit 1
+fi
+LIST_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list)
+if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY" || ! echo "$LIST_OUTPUT" | grep -q "(alice):"; then
+    echo "FAIL: Alice's pin did not survive the rejected re-pin attempt"
+    exit 1
+fi
+echo "OK: rejected re-pin did not disturb the existing \"alice\" pin"
+
+echo "==> Bob: re-adding \"alice\" with her actual (unchanged) card is a no-op success (AC4)"
+printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$ALICE_CARD"
+echo "OK: idempotent re-add succeeded"
+
 echo "==> Checking a wrong passphrase fails cleanly (no panic)"
 set +e
 WRONG_OUTPUT=$(printf 'totally-wrong\n' | "$CLI" --data-dir "$ALICE_DIR" list 2>&1)
@@ -118,4 +191,4 @@ fi
 echo "OK: wrong passphrase fails with a typed error (exit code $WRONG_STATUS), no panic"
 
 echo
-echo "All Slice 01 acceptance criteria demonstrated successfully."
+echo "All Slice 01 and Slice 02 acceptance criteria demonstrated successfully."
