@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Sympoden - Slice 01",
+        "title": "Sympoden",
         "width": 480,
         "height": 720,
         "resizable": true

@@ -22,7 +22,7 @@ const KEYFILE_NAME: &str = "identity.keyfile.json";
 const DB_NAME: &str = "notes.sqlite";
 
 #[derive(Parser)]
-#[command(name = "sympoden-cli", about = "Slice 01 CLI harness")]
+#[command(name = "sympoden-cli", about = "Sympoden CLI")]
 struct Cli {
     /// Directory holding this instance's keyfile, database, and peer card.
     #[arg(long, default_value = "./sympoden-data")]
