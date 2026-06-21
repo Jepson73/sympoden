@@ -25,16 +25,15 @@ jobs:
       - name: Clippy (-D warnings)
         run: cargo clippy -p sympoden-engine -p sympoden-relay -p sympoden-cli --all-targets -- -D warnings
 
-      - name: Slice 01 acceptance demo
+      - name: Acceptance demo
         run: scripts/demo.sh
 
   tauri-app:
-    # Separate, non-blocking job: sympoden-app (Tauri) needs system webview libraries
+    # Separate job: sympoden-app (Tauri) needs system webview libraries
     # that a plain ubuntu-latest runner doesn't have, mirroring demo.sh's and the
     # workspace's own exclusion of this crate from the headless default path.
-    name: Build sympoden-app (Tauri, optional)
+    name: Build sympoden-app (Tauri)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
