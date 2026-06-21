@@ -3391,7 +3391,7 @@ dependencies = [
 
 [[package]]
 name = "sympoden-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "sympoden-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "sympoden-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3441,7 +3441,7 @@ dependencies = [
 
 [[package]]
 name = "sympoden-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
