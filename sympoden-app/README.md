@@ -1,6 +1,6 @@
 # sympoden-app
 
-The Tauri desktop shell for Slice 01 — a thin view over `sympoden-engine`. No
+The Tauri desktop shell — a thin view over `sympoden-engine`. No
 security logic lives here; see `src/main.rs` for the (small) set of Tauri commands
 that wrap the engine, and `ui/` for the hand-written, build-step-free HTML/JS frontend.
 
@@ -89,12 +89,14 @@ The JSON shape `list_notes`/`sync_now` now return (`{note, trust}`, with `trust`
 `"Own"`/`"Unknown"`/`{"Known": "<label>"}`) was verified against the actual serializer
 output (not assumed), and `ui/main.js` was updated to match and render each case
 distinctly (a known peer's label, "you" for own notes, and an unmistakable `⚠ unknown
-sender` warning otherwise - never just the absence of a label). What this crate's own
-test suite and that verification do *not* cover is the same residual risk Slice 01
-already named: actually clicking through the updated GUI on a real desktop with a
-display server. That two-instance walkthrough (steps 1-5 above, now exercising the
-label field and the Known/Unknown labeling) has **not yet** been performed and should
-be done before calling Slice 02's UI "done," not just its engine/CLI layer.
+sender` warning otherwise - never just the absence of a label). The two-instance
+walkthrough (steps 1-5 above, exercising the label field and the Known/Unknown
+labeling) was performed on a real desktop on **2026-06-21** and confirmed by eye: an
+unrecognized sender renders the red `⚠ unknown sender` text; adding a second,
+differently-labeled peer is rejected with a typed message naming the existing peer;
+Known renders correctly in both directions once both sides have pinned each other; a
+self-authored note renders "you". See `docs/slices/SLICE-02.md`'s Status/Closeout
+sections for the full record.
 
 ## Known limitation: "handed to the relay" is not "delivered"
 

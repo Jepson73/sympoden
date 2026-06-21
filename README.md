@@ -7,10 +7,13 @@
 
 ## Status
 
-**Design complete; pre-implementation.** The design has been worked through in depth
-(see `docs/FOUNDATION.md`, currently v0.16). The next step is the first running slice,
-not more design. Everything in these docs is a *draft to be tested against reality* —
-the two genuinely unsolved problems can only be answered by building (see below).
+**Slices 01 and 02 shipped.** Identity + local note + async sync through one blind
+relay (Slice 01), and trust-on-first-use author↔peer binding on top of it (Slice 02),
+are both code-complete, headless-verified, and GUI-verified — see
+`docs/slices/SLICE-01.md` and `docs/slices/SLICE-02.md`. Next up is Phase 1 work per
+`docs/ROADMAP.md`. Everything in these docs remains a *draft to be tested against
+reality* — the two genuinely unsolved problems can only be answered by building
+further (see below).
 
 ## The non-negotiables (invariants)
 
@@ -35,7 +38,8 @@ decision contradicts one, the decision is wrong — not the invariant. Full text
 | `docs/FOUNDATION.md` | The vision: invariants, ladder, persistence, epistemics, interaction, discovery, ease/recovery, client architecture, open questions | To understand *why* |
 | `docs/ARCHITECTURE.md` | Concrete technical architecture + tech stack | To understand *how* |
 | `docs/ROADMAP.md` | Phased build order | To understand *what next* |
-| `docs/slices/SLICE-01.md` | The first prototype spec — build this first | To start building |
+| `docs/slices/SLICE-01.md` | The first prototype spec (shipped) | To see what's built |
+| `docs/slices/SLICE-02.md` | The TOFU trust-layer spec (shipped) | To see what's built |
 | `docs/RECONCILIATION.md` | Maps the original 24 ADRs to this foundation | When touching an ADR |
 | `docs/GLOSSARY.md` | Shared vocabulary | When a term is unclear |
 
@@ -57,9 +61,14 @@ not-a-backup) but is likewise only proven by real users.
 Rust engine (RustCrypto, libp2p, automerge, SQLite/SQLCipher) + Tauri desktop shell;
 arti/Tor for the hardened tier. Details and rationale in `docs/ARCHITECTURE.md`.
 
-## Starting point
+## Starting point (shipped)
 
-Build `docs/slices/SLICE-01.md`: a desktop app that creates an encrypted identity,
-posts a text note, and syncs it to a second instance through one blind relay — while
-the two instances are never online at the same time. A few hundred lines. It tests the
-core bet (async store-and-forward) and the identity friction, and nothing else.
+`docs/slices/SLICE-01.md`: a desktop app that creates an encrypted identity, posts a
+text note, and syncs it to a second instance through one blind relay — while the two
+instances are never online at the same time. It tested the core bet (async
+store-and-forward) and the identity friction.
+
+`docs/slices/SLICE-02.md` then made a received note's author meaningful: bound to a
+peer you pinned (trust-on-first-use), or flagged distinctly as unrecognized — peers
+now live only in the encrypted local store, never a plaintext file. See
+`docs/ROADMAP.md` for what's next.

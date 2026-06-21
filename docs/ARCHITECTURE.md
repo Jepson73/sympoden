@@ -125,7 +125,7 @@ Friend/circle (mutual, encrypted audience, may hold a leased copy).
 Reproducible builds; zero telemetry; encryption in transit at every tier; secrets
 zeroized; the engine headless-testable; invariants checked at every layer.
 
-## 9. Security properties and non-properties (as of Slice 01)
+## 9. Security properties and non-properties (as of Slice 02)
 
 A threat-model note, not a redesign — kept factual and tight.
 
@@ -136,18 +136,31 @@ A threat-model note, not a redesign — kept factual and tight.
   domain-separated bytes).
 - A structurally blind, non-logging relay (no crypto/identity dependency, no
   per-connection logging).
-- An encrypted-at-rest local store (SQLite + SQLCipher).
+- An encrypted-at-rest local store (SQLite + SQLCipher) — as of Slice 02, this includes
+  pinned peers (label + both public keys), not just notes; there is no longer a
+  plaintext peer file on disk.
+- **Trust-on-first-use author↔peer binding (Slice 02).** Every note shown to the user is
+  classified, at display time, as `Own` / `Known(label)` / `Unknown` against the local
+  `peers` table (`trust::classify_author`) — never displayed unclassified. Pinning is
+  TOFU: a label is bound to a key on first pin, and a later, different key under the
+  same label is rejected, never silently overwritten (key continuity at re-pin time).
 
 **DO NOT HAVE YET:**
 - Sender authorization (see Slice 01's accepted limitation on message authentication
-  vs. sender authorization).
-- Key continuity / TOFU (no binding yet between an `author_pubkey` and a recognized
-  peer identity — Phase 1).
+  vs. sender authorization). Slice 02's trust layer **labels** an unrecognized sender as
+  Unknown but does not block, gate, or quarantine their note — delivery is unaffected by
+  trust classification.
+- Per-individual distinction among unknown senders — all unrecognized keys render under
+  the identical `⚠ unknown sender` label; there is no key fingerprint shown to tell two
+  different unknown senders apart (deferred, see `docs/ROADMAP.md`).
+- Multi-peer support — exactly one peer can be pinned per identity this slice, so TOFU
+  binding has only ever been exercised against a single correspondent.
 - Replay-window semantics (no defense against a captured, still-valid envelope being
   replayed to the relay).
 - Resistance to relay-observable metadata: timing, blob size, and routing-key
   correlation across pushes/pulls are all visible to the relay operator even though
-  content is not.
+  content is not. The relay remains blind to trust classification too — it has no
+  notion of peers or labels; that judgment is entirely local to each client.
 
 ## 10. The open frontier (read before scaling anything)
 

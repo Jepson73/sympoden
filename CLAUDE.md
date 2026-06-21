@@ -65,9 +65,11 @@ in `docs/ARCHITECTURE.md`.
 
 ## What to build first
 
-**`docs/slices/SLICE-01.md`** — and nothing beyond it yet. Identity + local note +
-async sync between two non-simultaneous instances through one blind relay, on desktop.
-Follow the roadmap (`docs/ROADMAP.md`); do not build ahead of the current phase.
+**`docs/slices/SLICE-01.md`** (identity + local note + async sync between two
+non-simultaneous instances through one blind relay, on desktop) and
+**`docs/slices/SLICE-02.md`** (trust-on-first-use author↔peer binding on top of it) are
+both done — code-complete, headless-verified, and GUI-verified. Do not build ahead of
+the current phase; follow the roadmap (`docs/ROADMAP.md`) for what's next.
 
 ## What is OPEN — do NOT over-engineer
 
@@ -104,8 +106,19 @@ relay that never sees plaintext; the receiver verifies the sender's signature an
 displays the note; the client builds from source with no telemetry. See SLICE-01 for the
 precise acceptance criteria and the explicit non-goals.
 
+## Definition of done for Slice 02
+
+Every note shown to the user is classified, at display time, as the author's own
+(`Own`), a pinned peer (`Known`, by label), or unrecognized (`Unknown`, rendered
+distinctly and unmistakably) — never displayed unclassified. Pinning a peer is
+trust-on-first-use: a label binds to a key on first pin, and re-presenting that label
+with a different key is rejected, never silently overwritten. Peers live only in the
+encrypted SQLCipher store, never in a plaintext file. See SLICE-02 for the precise
+acceptance criteria, the accepted limitations, and the explicit non-goals.
+
 ## Doc map
 
 `README.md` (orientation) · `docs/FOUNDATION.md` (vision/why) · `docs/ARCHITECTURE.md`
 (how) · `docs/ROADMAP.md` (what next) · `docs/slices/SLICE-01.md` (first build) ·
-`docs/RECONCILIATION.md` (ADR mapping) · `docs/GLOSSARY.md` (terms).
+`docs/slices/SLICE-02.md` (TOFU trust layer) · `docs/RECONCILIATION.md` (ADR mapping) ·
+`docs/GLOSSARY.md` (terms).

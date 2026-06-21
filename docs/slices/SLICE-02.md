@@ -93,20 +93,34 @@ under Correctness):
   - **Known** — `author_pubkey` exactly matches the single pinned peer's Ed25519 key.
     Displayed with that peer's label.
   - **Unknown** — matches no pinned peer (including the case where no peer is pinned at
-    all yet). Displayed distinctly and **unmistakably** — e.g. `⚠ unknown sender
-    <hex prefix>` with a visual treatment (not merely the absence of a label) that cannot
-    be confused with a known-peer label at a glance. This distinctness is the entire
-    security point of the slice and is non-negotiable. The note is still **accepted and
-    stored** — not rejected or quarantined. Rationale: this matches Slice 01's
-    already-accepted threat model (anyone holding your card can deliver to you); the new
-    behavior is honest labeling of identity, not a new delivery gate (see the
-    identification-vs-delivery framing at the top of this doc).
+    all yet). Displayed distinctly and **unmistakably** — shipped as the literal string
+    `⚠ unknown sender` (CLI, plain text; app, in red via the `trust-unknown` CSS class),
+    a visual treatment (not merely the absence of a label) that cannot be confused with a
+    known-peer label at a glance. This distinctness is the entire security point of the
+    slice and is non-negotiable. **As shipped, there is no per-key hex prefix or other
+    fingerprint** — every unknown sender renders identically; distinguishing one unknown
+    sender from another is deferred (see Known Limitation f below and the ROADMAP
+    follow-up). The note is still **accepted and stored** — not rejected or quarantined.
+    Rationale: this matches Slice 01's already-accepted threat model (anyone holding your
+    card can deliver to you); the new behavior is honest labeling of identity, not a new
+    delivery gate (see the identification-vs-delivery framing at the top of this doc).
 
   Key continuity ("changed key") is therefore a **re-pin-time event, at `add-peer`**, not
   a per-note classification: if `add-peer` is called with a label that already has a pin,
   and the new card's Ed25519 *or* X25519 key differs from what's pinned, it is **rejected**
   by default with a typed error — never silently overwritten. Re-adding the *same* label
   with the *same* keys is a no-op success (idempotent).
+
+  **This rejection is independent of the one-peer cap (D2), not gated by it.**
+  `Store::add_peer` checks for a same-label match *before* checking the one-peer cap, so
+  re-pinning the single configured peer's label with a different key is rejected with
+  `PeerKeyMismatch` regardless of how many peers are configured — it does not require, and
+  is not blocked by, multi-peer support. Verified both by `store.rs`'s
+  `add_peer_rejects_a_changed_key_under_the_same_label` unit test and by a live CLI
+  reproduction during the Slice 02 closeout (2026-06-21): pinning "bob" once, then
+  re-running `add-peer bob <a different card>`, fails with `"bob" is already pinned to a
+  different key - refusing to silently re-pin`, exit code 1 — exercised with exactly one
+  peer pinned, never two.
 
   **Escape hatch — ruled, conscious choice, not an accident:** there is **no** override
   flag and **no** delete/replace-peer command in this slice. Combined with the
@@ -243,19 +257,33 @@ the peers-table lookup.
     trust-annotated wrapper, so omitting classification before display is a compile error,
     not a possible bug.
 
-**Status:** code-complete and headless-verified — `cargo test --workspace` and
-`cargo clippy --workspace --all-targets -- -D warnings` are clean across every crate
-(engine, cli, relay, app), and the extended `scripts/demo.sh` demonstrates AC1-AC10
-end to end against a live relay (known-peer binding, unknown-sender labeling,
-recompute-at-display after pinning, the single-peer cap, rejected re-pin, and
-idempotent re-add), plus all of Slice 01's original criteria unchanged. AC11 (own-note
-`Own` classification) and AC12 (no bare-`StoredNote` display path) are covered by
-engine/app unit tests. The app's webview frontend (`ui/main.js`, `ui/index.html`) was
-updated for the new `{note, trust}` IPC shape and that shape was checked against the
-real serializer output (not assumed), but the actual two-instance GUI click-through on
-a real desktop has **not yet** been performed — see `sympoden-app/README.md`'s
-"Slice 02 GUI status" section. That manual step, not anything in this codebase, is
-what's left before this slice's UI can be called fully done.
+**Status:** code-complete, headless-verified, and GUI-verified —
+`cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` are
+clean across every crate (engine, cli, relay, app), and the extended `scripts/demo.sh`
+demonstrates AC1-AC10 end to end against a live relay (known-peer binding,
+unknown-sender labeling, recompute-at-display after pinning, the single-peer cap,
+rejected re-pin, and idempotent re-add), plus all of Slice 01's original criteria
+unchanged (AC9; independently re-confirmed by a zero-diff `git diff` of `sync.rs`,
+`crypto.rs`, `content.rs`, and the whole `relay` crate against the `v0.1.1` tag — AC10).
+AC11 (own-note `Own` classification) and AC12 (no bare-`StoredNote` display path) are
+covered by engine/app unit tests, and AC12 was independently re-audited by inspection
+during the Slice 02 closeout: every note-rendering path in the CLI (`cmd_list`,
+`cmd_sync`) and the app (`list_notes_inner`, `sync_now_inner`, and the frontend's
+`describeTrust`) takes only a `TrustedNote`/`{note, trust}` shape, never a bare
+`StoredNote` — see the closeout report for the call-site evidence.
+
+The two-instance GUI click-through (the same walkthrough steps as Slice 01, now
+exercising the label field and the Known/Unknown labeling) was performed on
+**2026-06-21** and confirmed by eye:
+- An unrecognized sender's note renders the red `⚠ unknown sender` text (CSS class
+  `trust-unknown`) — never blank, never confusable with a label.
+- Adding a second, differently-labeled peer while one is already configured is rejected
+  with the one-peer-cap's typed message, which names the existing peer by label (e.g.
+  `a peer is already configured as "Bob" - this slice supports only one peer`).
+- With both sides pinned, Known renders bidirectionally — Alice's note shows up on Bob's
+  screen under the label Bob pinned her as, and Bob's note shows up on Alice's screen
+  under the label Alice pinned him as.
+- A self-authored note renders "you" (CSS class `trust-own`), never Unknown.
 
 ## Explicit NON-GOALS (do not build these in Slice 02)
 
@@ -294,6 +322,43 @@ c. **Single correspondent only.** Exactly one peer can be configured per identit
 d. **Trust display is current-knowledge, not point-in-time.** Per D3, a note's shown
    trust state can change after the fact (e.g. a previously-unknown sender becomes known
    once pinned). Nothing here records "what we believed when this note arrived."
+e. **Unknown senders are identified, not blocked.** `receive_incoming` (`sync.rs`) is
+   byte-for-byte unchanged from Slice 01 (see AC10): an unknown sender's note is still
+   decrypted, signature-verified, and stored exactly as before this slice. This slice
+   adds a display-time label, nothing more — see the identification-vs-delivery framing
+   at the top of this doc.
+f. **No per-key fingerprint for unknowns.** Every unrecognized sender renders as the
+   identical literal `⚠ unknown sender` string; there is nothing distinguishing one
+   unknown sender from another (no key prefix, no per-sender color/icon). If two
+   different unpinned keys both send you a note, both show up under the same label.
+   Deferred — see `docs/ROADMAP.md`.
+g. **Slice 01's sender-authorization gap is surfaced, not closed.** A note from an
+   unpinned key is now visibly flagged Unknown at display time, but nothing at the
+   protocol level prevents it from being delivered, decrypted, and stored in the first
+   place — anyone holding the recipient's public card can still push a note that lands,
+   verifies, and gets stored under the Unknown label (Slice 01 limitation (a), restated:
+   this is message authentication, not sender authorization). Closing this gap would
+   need relay/routing-key protocol changes, explicitly out of scope here (see NON-GOALS).
+
+## Closeout (2026-06-21)
+
+Mirrors Slice 01's closeout discipline. Beyond the Status/GUI-verification note above:
+
+- **`peer.json` disposition:** abandoned, as D2 specified — not migrated. A grep of the
+  current workspace (`peer.json`, `PEER_NAME`, `peer_path`, `load_peer`) returns zero
+  hits; the code that wrote/read it (present in `v0.1.1`) was deleted outright, not left
+  dormant. Peers now live only as rows in the `peers` table inside the SQLCipher-encrypted
+  database. One residual note for anyone upgrading a real Slice-01-era data directory (no
+  such users exist yet, but for the record): the old plaintext `peer.json` file, if one
+  exists on disk from a prior Slice 01 install, is neither read nor deleted by this
+  slice's code — it becomes an inert, orphaned file. It holds only a public card (not
+  secret key material), so its presence is not a confidentiality regression, but it is
+  not cleaned up either; deleting it is left to the user (or a future migration) rather
+  than building one-time-use cleanup code for a prototype with no real installs.
+- **Identity additivity:** `git diff v0.1.1..HEAD -- sympoden-engine/src/identity.rs`
+  shows exactly one new function (`PublicCard::from_pinned_peer`) and its unit test
+  appended; every pre-existing line, including every other function's signature, is
+  untouched.
 
 ## Invariant check for this slice
 

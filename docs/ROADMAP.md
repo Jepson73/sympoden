@@ -12,17 +12,36 @@ product on mobile.
 
 ---
 
-## Phase 0 — Slice 01 (prototype)  → `docs/slices/SLICE-01.md`
+## Phase 0 — Slices 01–02 (prototype)  → `docs/slices/SLICE-01.md`, `docs/slices/SLICE-02.md`
 
-**Goal:** the smallest runnable thing. Desktop (Tauri + Rust engine): create an encrypted
-identity, post a text note locally, sync it to a second instance through one blind relay —
-the two instances **never online at the same time**.
+**Goal:** the smallest runnable thing, then make a received note's author meaningful.
+Slice 01 (Tauri + Rust engine): create an encrypted identity, post a text note locally,
+sync it to a second instance through one blind relay — the two instances **never online
+at the same time**. Slice 02: bind a note's verified author to a pinned peer at display
+time (trust-on-first-use), or flag it distinctly as unrecognized.
 
 **Proves:** (1) async store-and-forward via a blind relay actually works; (2) the
-identity-creation friction is tolerable.
+identity-creation friction is tolerable; (3, Slice 02) TOFU author↔peer binding works
+end to end and is non-bypassable at display.
 
-**Non-goals:** circles, media, discovery, DHT, Tor, mobile, automerge, group keys, social
-recovery, polished UI. One screen, two buttons.
+**Shipped (Slice 02), with follow-ups it surfaced:**
+- **Multi-peer + recipient selection** — Slice 02 caps at one peer per identity
+  precisely because `post`/`prepare_outgoing` address a single recipient; supporting
+  more peers needs a real addressing/recipient-selection answer. Phase 1 work, alongside
+  circles/follow/friend.
+- **Unknown-sender key fingerprint** — Slice 02 renders every unrecognized sender
+  identically (`⚠ unknown sender`, no distinguishing mark). Showing a short key
+  fingerprint per unknown sender (so two different unpinned senders read as different)
+  is deferred to whenever multi-peer lands.
+- **Peer delete/replace** — Slice 02 has no in-product way to un-stick a mistyped label
+  or accept a peer's legitimately rotated key; the only path is a fresh data directory.
+  A real, deliberate re-pin/rotate/delete operation is Phase 1 contact-management work,
+  not something to improvise as a quick patch.
+
+**Non-goals (Slice 01):** circles, media, discovery, DHT, Tor, mobile, automerge, group
+keys, social recovery, polished UI. One screen, two buttons.
+**Non-goals (Slice 02):** out-of-band key verification, revocation, multi-peer, blocking
+unknown senders — see `docs/slices/SLICE-02.md`'s NON-GOALS for the full list.
 
 ---
 
@@ -34,11 +53,23 @@ recovery, polished UI. One screen, two buttons.
 follow vs friend; the ephemeral presence-gated layer + blind relay buffer; the two-secret
 model; **social recovery** (Shamir among trusted contacts); the **easy security tier**
 with convenient recovery; the "My circles" channel; a real (still simple) UI; the
-interaction-indexes / no-doomscroll feed behaviour; **author<->peer binding + key
-continuity (TOFU)** — on receive, match `author_pubkey` to a known peer and show their
-name, else flag as an unknown key (resolves Slice 01's accepted sender-authorization
-gap); **relay memory management** — active expiry/GC plus request limits, building on
-Slice 01's request-size cap (resolves Slice 01's accepted lazy-expiry gap).
+interaction-indexes / no-doomscroll feed behaviour; **multi-peer support, recipient
+selection on send, peer delete/replace, and an unknown-sender key fingerprint** (the
+follow-ups Slice 02's single-peer TOFU prototype surfaced — see Phase 0 above);
+**relay memory management** — active expiry/GC plus request limits, building on
+Slice 01's request-size cap (resolves Slice 01's accepted lazy-expiry gap); closing
+Slice 01/02's accepted sender-authorization gap at the protocol level (today, an unknown
+sender's note is labeled, not blocked — see `docs/ARCHITECTURE.md` §9).
+
+A related, still-open distinction to design deliberately here rather than improvise: peer
+**exchange** UX when a channel already exists between two people (e.g. a QR code, a
+`sympoden://` link, or a short pairing code, to make pinning a peer's card easier than
+copy-pasting base64) is a friendly, bounded UX problem. Peer **discovery** — finding
+someone you don't already have a channel to — is a different and much harder problem,
+in direct tension with the no-central-directory privacy thesis (any discovery mechanism
+is itself a place that could be ordered to log or surveil who's looking for whom). Keep
+these two clearly separate: build (a) when it's useful; do not let it quietly grow into
+(b) without a deliberate decision.
 
 **Proves / validates the frontier:** can *nontechnical families* actually create
 identities, share, and recover a "lost" phone via social recovery? Test with real
