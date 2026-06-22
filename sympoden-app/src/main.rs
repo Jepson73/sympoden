@@ -1,5 +1,5 @@
-//! Tauri shell for Slice 01: a thin view over sympoden-engine. No security logic
-//! lives here - identity, crypto, storage, and sync are all the engine's job.
+//! Tauri shell: a thin view over sympoden-engine. No security logic lives here -
+//! identity, crypto, storage, and sync are all the engine's job.
 //!
 //! Every `#[tauri::command]` below is a thin lock-and-delegate wrapper around a plain
 //! function (no Tauri types in its signature) that does the actual work. That split
@@ -23,8 +23,8 @@ use thiserror::Error;
 
 use sympoden_engine::content::Note;
 use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError};
-use sympoden_engine::identity::{Identity, PublicCard};
-use sympoden_engine::store::Store;
+use sympoden_engine::identity::{Identity, PublicCard, fingerprint_hex, format_fingerprint};
+use sympoden_engine::store::{AddPeerOutcome, PinnedPeer, SendTargets, Store, resolve_peer_query};
 use sympoden_engine::sync::{self, RelayClient};
 use sympoden_engine::trust::{self, TrustedNote};
 
@@ -84,6 +84,64 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// A pinned peer as shown to the frontend: label plus its key (the value to submit
+/// back for recipient selection / relabeling) plus its display fingerprint (Slice 03
+/// D5) - never a bare label, since a label no longer identifies one peer by itself.
+#[derive(Debug, Serialize, Clone)]
+struct PeerView {
+    label: String,
+    ed25519_pubkey: String,
+    fingerprint: String,
+}
+
+impl From<&PinnedPeer> for PeerView {
+    fn from(peer: &PinnedPeer) -> Self {
+        Self {
+            label: peer.label.clone(),
+            ed25519_pubkey: peer.ed25519_pubkey.clone(),
+            fingerprint: format_fingerprint(&fingerprint_hex(&peer.ed25519_pubkey)),
+        }
+    }
+}
+
+/// A note as shown to the frontend: the trust-annotated note plus the author's display
+/// fingerprint, computed here from `StoredNote::author_pubkey` - never threaded through
+/// `AuthorTrust` itself, which is what keeps `trust.rs` zero-diff (SLICE-03.md D5). The
+/// only way to construct one is `From<TrustedNote>`, so - same as `TrustedNote` itself -
+/// there is no path to a `NoteView` that skipped classification.
+#[derive(Serialize)]
+struct NoteView {
+    note: sympoden_engine::store::StoredNote,
+    trust: sympoden_engine::trust::AuthorTrust,
+    fingerprint: String,
+}
+
+impl From<TrustedNote> for NoteView {
+    fn from(trusted: TrustedNote) -> Self {
+        let fingerprint = format_fingerprint(&fingerprint_hex(&trusted.note().author_pubkey));
+        Self {
+            note: trusted.note().clone(),
+            trust: trusted.trust().clone(),
+            fingerprint,
+        }
+    }
+}
+
+/// What `add_peer_card` did, or whether it needs the frontend to confirm a label
+/// collision first (SLICE-03.md D3 - the app's side of the same engine seam the CLI's
+/// `--strict` flag exercises).
+#[derive(Debug, Serialize)]
+enum AddPeerResult {
+    NeedsCollisionConfirmation { existing: Vec<PeerView> },
+    Outcome(AddPeerOutcome),
+}
+
+#[derive(Debug, Serialize)]
+enum RelabelResult {
+    NeedsCollisionConfirmation { existing: Vec<PeerView> },
+    Relabeled,
+}
+
 // ---------------------------------------------------------------------------------
 // Plain functions: all engine-calling logic, no Tauri types in any signature. Each
 // one maps 1:1 to a Tauri command below and is exercised directly in `tests`.
@@ -109,10 +167,18 @@ fn whoami_card(session: &Session) -> PublicCard {
     session.identity.public_card()
 }
 
-/// Pin a peer's card under `label` in the encrypted store. Requires an unlocked
-/// `Session` (the store needs `db_key`) - peer labels are user-created data and now
-/// live encrypted at rest like everything else, not in a plaintext file.
-fn add_peer_card(session: &Session, label: &str, card: &str) -> Result<(), AppError> {
+/// Pin a peer's card under `label`. Key-as-identity (SLICE-03.md D1-D3): if the card's
+/// key is genuinely new and would collide with an existing, different peer's label,
+/// and the frontend hasn't already confirmed it (`confirm_collision`), nothing is
+/// written - the caller gets back the colliding peer(s) to show in a confirm dialog.
+/// Otherwise delegates straight to `Store::add_peer`, whose own outcome (including the
+/// loud `AlreadyPinnedUnderLabel` no-op, Adjustment 3) is returned as-is.
+fn add_peer_card(
+    session: &Session,
+    label: &str,
+    card: &str,
+    confirm_collision: bool,
+) -> Result<AddPeerResult, AppError> {
     let parsed: PublicCard =
         serde_json::from_str(card).map_err(|e| AppError::InvalidCard(e.to_string()))?;
 
@@ -120,14 +186,71 @@ fn add_peer_card(session: &Session, label: &str, card: &str) -> Result<(), AppEr
     let ed25519_pubkey = hex::encode(parsed.ed25519_verifying_key()?.as_bytes());
     let x25519_pubkey = hex::encode(parsed.x25519_public_key()?.to_bytes());
 
-    session
+    if !confirm_collision && session.store.get_peer_by_key(&ed25519_pubkey)?.is_none() {
+        let collisions = session.store.check_label_collision(label, &ed25519_pubkey)?;
+        if !collisions.is_empty() {
+            return Ok(AddPeerResult::NeedsCollisionConfirmation {
+                existing: collisions.iter().map(PeerView::from).collect(),
+            });
+        }
+    }
+
+    let outcome = session
         .store
         .add_peer(label, &ed25519_pubkey, &x25519_pubkey, now_unix())?;
-    Ok(())
+    Ok(AddPeerResult::Outcome(outcome))
 }
 
-fn post_note_now(session: &Session, body: String, created_at: i64) -> Result<String, AppError> {
+/// Rename a pinned peer's label, addressed by key/label/fingerprint query (same
+/// resolution as the CLI's `relabel-peer`). Same confirm-before-write collision flow
+/// as `add_peer_card`.
+fn relabel_peer_now(
+    session: &Session,
+    query: &str,
+    new_label: &str,
+    confirm_collision: bool,
+) -> Result<RelabelResult, AppError> {
+    let peers = session.store.list_peers()?;
+    let target = resolve_peer_query(query, &peers)?.clone();
+
+    if !confirm_collision {
+        let collisions = session
+            .store
+            .check_label_collision(new_label, &target.ed25519_pubkey)?;
+        if !collisions.is_empty() {
+            return Ok(RelabelResult::NeedsCollisionConfirmation {
+                existing: collisions.iter().map(PeerView::from).collect(),
+            });
+        }
+    }
+
+    session.store.relabel_peer(&target.ed25519_pubkey, new_label)?;
+    Ok(RelabelResult::Relabeled)
+}
+
+fn list_peers_inner(session: &Session) -> Result<Vec<PeerView>, AppError> {
+    Ok(session.store.list_peers()?.iter().map(PeerView::from).collect())
+}
+
+/// `recipients`: `None` or an empty list addresses every currently pinned peer
+/// (broadcast); a non-empty list addresses exactly those keys (directed). The frontend
+/// resolves its checkbox selection to keys itself (it is keyed by `ed25519_pubkey`, not
+/// label, so there's no ambiguous-query problem to solve here the way the CLI's `--to`
+/// has to). Send targets are recorded *before* the note is inserted (SLICE-03.md D7),
+/// so an invalid target never leaves an orphaned, unaddressed note behind.
+fn post_note_now(
+    session: &Session,
+    body: String,
+    created_at: i64,
+    recipients: Option<Vec<String>>,
+) -> Result<String, AppError> {
+    let targets = match recipients {
+        Some(keys) if !keys.is_empty() => SendTargets::Directed(keys),
+        _ => SendTargets::Broadcast,
+    };
+
     let note = Note::new(&session.identity.signing_key, body, created_at);
+    session.store.record_pending_sends(&note.id_hex(), &targets)?;
     session.store.insert_note(&note.to_stored())?;
     Ok(note.id_hex())
 }
@@ -135,44 +258,41 @@ fn post_note_now(session: &Session, body: String, created_at: i64) -> Result<Str
 #[derive(Serialize)]
 struct SyncResult {
     pushed: Vec<String>,
-    received: Option<TrustedNote>,
+    received: Option<NoteView>,
 }
 
 fn sync_now_inner(session: &Session, relay: String) -> Result<SyncResult, AppError> {
     let client = RelayClient::new(relay);
-    let peers = session.store.list_peers()?;
     let my_key = session.identity.signing_key.verifying_key();
 
     let mut pushed = Vec::new();
-    if let Some(peer) = peers.first() {
-        let card = PublicCard::from_pinned_peer(peer)?;
-        let my_pubkey_hex = hex::encode(my_key.as_bytes());
-        let pending = session.store.unsynced_own_notes(&my_pubkey_hex)?;
-        for stored in pending {
-            let note = Note::from_stored(&stored)?;
-            let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &card)?;
-            match client.push(&routing_key, &envelope_bytes)? {
-                sync::PushOutcome::Accepted => {
-                    session.store.mark_synced(&stored.id, now_unix())?;
-                    pushed.push(stored.id);
-                }
-                sync::PushOutcome::RecipientSlotOccupied => {
-                    // The peer hasn't pulled their previous note yet - the relay
-                    // holds only one blob per recipient. Stop pushing for now; this
-                    // note (and any after it) stay pending for the next sync.
-                    break;
-                }
+    for send in session.store.pending_sends()? {
+        let note = Note::from_stored(&send.note)?;
+        let card = PublicCard::from_pinned_peer(&send.peer)?;
+        let (routing_key, envelope_bytes) = sync::prepare_outgoing(&note, &card)?;
+        match client.push(&routing_key, &envelope_bytes)? {
+            sync::PushOutcome::Accepted => {
+                session
+                    .store
+                    .mark_send_pushed(&send.note.id, &send.peer.ed25519_pubkey, now_unix())?;
+                pushed.push(send.note.id);
+            }
+            sync::PushOutcome::RecipientSlotOccupied => {
+                // This recipient hasn't pulled their previous note yet. Leave this row
+                // pending and move on to the next one - one occupied slot must never
+                // block delivery to any other recipient of the same note.
             }
         }
     }
 
+    let peers = session.store.list_peers()?;
     let my_routing_key = sympoden_engine::crypto::routing_key_for(&my_key);
     let received = match client.pull(&my_routing_key)? {
         Some(envelope_bytes) => {
             let note = sync::receive_incoming(&envelope_bytes, &session.identity.x25519_secret)?;
             let trusted = trust::classify_stored_note(note.to_stored(), &my_key, &peers)?;
             session.store.insert_note(trusted.note())?;
-            Some(trusted)
+            Some(NoteView::from(trusted))
         }
         None => None,
     };
@@ -180,7 +300,7 @@ fn sync_now_inner(session: &Session, relay: String) -> Result<SyncResult, AppErr
     Ok(SyncResult { pushed, received })
 }
 
-fn list_notes_inner(session: &Session) -> Result<Vec<TrustedNote>, AppError> {
+fn list_notes_inner(session: &Session) -> Result<Vec<NoteView>, AppError> {
     let peers = session.store.list_peers()?;
     let my_key = session.identity.signing_key.verifying_key();
 
@@ -188,7 +308,11 @@ fn list_notes_inner(session: &Session) -> Result<Vec<TrustedNote>, AppError> {
         .store
         .list_notes()?
         .into_iter()
-        .map(|note| trust::classify_stored_note(note, &my_key, &peers).map_err(AppError::from))
+        .map(|note| {
+            trust::classify_stored_note(note, &my_key, &peers)
+                .map(NoteView::from)
+                .map_err(AppError::from)
+        })
         .collect()
 }
 
@@ -234,23 +358,57 @@ fn whoami(state: State<AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn add_peer(state: State<AppState>, label: String, card: String) -> Result<(), String> {
+fn add_peer(
+    state: State<AppState>,
+    label: String,
+    card: String,
+    confirm_collision: bool,
+) -> Result<AddPeerResult, String> {
     let guard = state
         .session
         .lock()
         .map_err(|_| "internal error".to_string())?;
     let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
-    add_peer_card(session, &label, &card).map_err(|e| e.to_string())
+    add_peer_card(session, &label, &card, confirm_collision).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn post_note(state: State<AppState>, body: String) -> Result<String, String> {
+fn relabel_peer(
+    state: State<AppState>,
+    query: String,
+    new_label: String,
+    confirm_collision: bool,
+) -> Result<RelabelResult, String> {
     let guard = state
         .session
         .lock()
         .map_err(|_| "internal error".to_string())?;
     let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
-    post_note_now(session, body, now_unix()).map_err(|e| e.to_string())
+    relabel_peer_now(session, &query, &new_label, confirm_collision).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_peers(state: State<AppState>) -> Result<Vec<PeerView>, String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "internal error".to_string())?;
+    let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
+    list_peers_inner(session).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn post_note(
+    state: State<AppState>,
+    body: String,
+    recipients: Option<Vec<String>>,
+) -> Result<String, String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "internal error".to_string())?;
+    let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
+    post_note_now(session, body, now_unix(), recipients).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -264,7 +422,7 @@ fn sync_now(state: State<AppState>, relay: String) -> Result<SyncResult, String>
 }
 
 #[tauri::command]
-fn list_notes(state: State<AppState>) -> Result<Vec<TrustedNote>, String> {
+fn list_notes(state: State<AppState>) -> Result<Vec<NoteView>, String> {
     let guard = state
         .session
         .lock()
@@ -299,6 +457,8 @@ fn main() {
             unlock_identity,
             whoami,
             add_peer,
+            relabel_peer,
+            list_peers,
             post_note,
             sync_now,
             list_notes,
@@ -359,13 +519,14 @@ mod tests {
         assert_eq!(card_keys, expected_card_keys);
 
         // post_note -> a content-addressed id (String), then list_notes ->
-        // Vec<TrustedNote>: {note: {id/author_pubkey/body/created_at/signature/
-        // synced_at}, trust: ...}. The body is the one piece of plaintext a command
-        // is meant to surface - the user's own note, read back to them. Nothing else
-        // is secret: the pubkey, signature, and trust label are public/local-judgment
-        // data, not key material.
+        // Vec<NoteView>: {note: {id/author_pubkey/body/created_at/signature/
+        // synced_at}, trust: ..., fingerprint: ...}. The body is the one piece of
+        // plaintext a command is meant to surface - the user's own note, read back to
+        // them. Nothing else is secret: the pubkey, signature, trust label, and
+        // fingerprint are public/local-judgment/derived-from-public data, not key
+        // material.
         let secret_body = "only the body should ever leave the process";
-        post_note_now(&session, secret_body.to_string(), 1_700_000_000).unwrap();
+        post_note_now(&session, secret_body.to_string(), 1_700_000_000, None).unwrap();
         let notes = list_notes_inner(&session).unwrap();
         let note_json = serde_json::to_value(&notes[0]).unwrap();
         let note_obj = note_json.as_object().unwrap();
@@ -374,7 +535,7 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["note", "trust"]
+            ["note", "trust", "fingerprint"]
                 .into_iter()
                 .map(String::from)
                 .collect()
@@ -452,12 +613,12 @@ mod tests {
     fn add_peer_rejects_a_malformed_card_cleanly() {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "passphrase").unwrap();
-        let result = add_peer_card(&session, "bob", "not json at all");
+        let result = add_peer_card(&session, "bob", "not json at all", false);
         assert!(matches!(result, Err(AppError::InvalidCard(_))));
     }
 
     #[test]
-    fn add_peer_rejects_a_second_distinct_label() {
+    fn add_peer_under_a_second_and_third_distinct_label_succeeds_the_cap_is_gone() {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "passphrase").unwrap();
         let bob_dir = dir.path().join("bob");
@@ -469,13 +630,100 @@ mod tests {
 
         let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
         let carol_card = serde_json::to_string(&whoami_card(&carol)).unwrap();
-        add_peer_card(&session, "bob", &bob_card).unwrap();
 
-        let result = add_peer_card(&session, "carol", &carol_card);
+        let first = add_peer_card(&session, "bob", &bob_card, false).unwrap();
         assert!(matches!(
-            result,
-            Err(AppError::Store(StoreError::PeerAlreadyConfigured { .. }))
+            first,
+            AddPeerResult::Outcome(AddPeerOutcome::Added)
         ));
+
+        let second = add_peer_card(&session, "carol", &carol_card, false).unwrap();
+        assert!(matches!(
+            second,
+            AddPeerResult::Outcome(AddPeerOutcome::Added)
+        ));
+
+        assert_eq!(list_peers_inner(&session).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn add_peer_under_a_shared_label_needs_confirmation_then_succeeds() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        let eve_dir = dir.path().join("eve");
+        fs::create_dir_all(&bob_dir).unwrap();
+        fs::create_dir_all(&eve_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let eve = create_identity_session(&eve_dir, "eve-pass").unwrap();
+
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let eve_card = serde_json::to_string(&whoami_card(&eve)).unwrap();
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+
+        // A different key under the same label, without confirmation: nothing is
+        // written, the existing peer is surfaced for a confirm dialog.
+        let needs_confirm = add_peer_card(&session, "bob", &eve_card, false).unwrap();
+        match needs_confirm {
+            AddPeerResult::NeedsCollisionConfirmation { existing } => {
+                assert_eq!(existing.len(), 1);
+                assert_eq!(existing[0].label, "bob");
+            }
+            other => panic!("expected a collision confirmation prompt, got {other:?}"),
+        }
+        assert_eq!(list_peers_inner(&session).unwrap().len(), 1);
+
+        // Confirmed: now it proceeds, and both peers - same label, different keys -
+        // coexist.
+        let confirmed = add_peer_card(&session, "bob", &eve_card, true).unwrap();
+        assert!(matches!(
+            confirmed,
+            AddPeerResult::Outcome(AddPeerOutcome::Added)
+        ));
+        assert_eq!(list_peers_inner(&session).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn add_peer_with_an_already_pinned_key_under_a_new_label_is_a_loud_no_op() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        let result = add_peer_card(&session, "robert", &bob_card, false).unwrap();
+
+        match result {
+            AddPeerResult::Outcome(AddPeerOutcome::AlreadyPinnedUnderLabel { existing_label }) => {
+                assert_eq!(existing_label, "bob");
+            }
+            other => panic!("expected AlreadyPinnedUnderLabel, got {other:?}"),
+        }
+        let peers = list_peers_inner(&session).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].label, "bob");
+    }
+
+    #[test]
+    fn relabel_peer_renames_without_changing_the_key() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        let original_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
+
+        let result = relabel_peer_now(&session, "bob", "robert", false).unwrap();
+        assert!(matches!(result, RelabelResult::Relabeled));
+
+        let peers = list_peers_inner(&session).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].label, "robert");
+        assert_eq!(peers[0].ed25519_pubkey, original_key);
     }
 
     #[test]
@@ -483,26 +731,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "passphrase").unwrap();
 
-        post_note_now(&session, "hello, world".to_string(), 1_700_000_000).unwrap();
+        post_note_now(&session, "hello, world".to_string(), 1_700_000_000, None).unwrap();
         let notes = list_notes_inner(&session).unwrap();
 
         assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].note().body, "hello, world");
+        assert_eq!(notes[0].note.body, "hello, world");
     }
 
-    // AC11: the user's own posted note must classify as Own ("you"), never Unknown -
-    // its author_pubkey is this identity's own key, which never needs to (and must
-    // not need to) appear in the peers table.
+    // AC11 (Slice 02): the user's own posted note must classify as Own ("you"), never
+    // Unknown - its author_pubkey is this identity's own key, which never needs to
+    // (and must not need to) appear in the peers table.
     #[test]
     fn own_posted_note_classifies_as_own_not_unknown() {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "passphrase").unwrap();
 
-        post_note_now(&session, "hello, world".to_string(), 1_700_000_000).unwrap();
+        post_note_now(&session, "hello, world".to_string(), 1_700_000_000, None).unwrap();
         let notes = list_notes_inner(&session).unwrap();
 
         assert_eq!(notes.len(), 1);
-        assert_eq!(*notes[0].trust(), sympoden_engine::trust::AuthorTrust::Own);
+        assert_eq!(
+            notes[0].trust,
+            sympoden_engine::trust::AuthorTrust::Own
+        );
     }
 
     /// A real, in-process relay: a live TCP listener backed by a shared `HashMap`
@@ -630,20 +881,21 @@ mod tests {
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
 
         let bob_card_json = serde_json::to_string(&whoami_card(&bob)).unwrap();
-        add_peer_card(&alice, "bob", &bob_card_json).unwrap();
+        add_peer_card(&alice, "bob", &bob_card_json, false).unwrap();
         // Bob also pins Alice, so the note that flows (Alice -> Bob) classifies as
         // Known on Bob's side, not Unknown - without this, the test would never
         // exercise SLICE-02's actual headline property.
         let alice_card_json = serde_json::to_string(&whoami_card(&alice)).unwrap();
-        add_peer_card(&bob, "alice", &alice_card_json).unwrap();
+        add_peer_card(&bob, "alice", &alice_card_json, false).unwrap();
 
         let body = "hello bob, from a headless two-session test".to_string();
-        post_note_now(&alice, body.clone(), 1_700_000_000).unwrap();
+        post_note_now(&alice, body.clone(), 1_700_000_000, None).unwrap();
 
         let relay_addr = start_test_relay();
 
-        // Alice pushes to the relay, then (in spirit) goes fully offline - nothing
-        // about her session is touched again in this test.
+        // Alice pushes to the relay (broadcast - her only pinned peer, Bob), then (in
+        // spirit) goes fully offline - nothing about her session is touched again in
+        // this test.
         let alice_sync = sync_now_inner(&alice, relay_addr.to_string()).unwrap();
         assert_eq!(alice_sync.pushed.len(), 1);
         assert!(alice_sync.received.is_none());
@@ -654,13 +906,51 @@ mod tests {
         let received = bob_sync
             .received
             .expect("bob should have received alice's note from the relay");
-        assert_eq!(received.note().body, body);
+        assert_eq!(received.note.body, body);
         assert_eq!(
-            *received.trust(),
+            received.trust,
             sympoden_engine::trust::AuthorTrust::Known("alice".to_string())
         );
 
         let bob_notes = list_notes_inner(&bob).unwrap();
-        assert!(bob_notes.iter().any(|n| n.note().body == body));
+        assert!(bob_notes.iter().any(|n| n.note.body == body));
+    }
+
+    #[test]
+    fn broadcast_post_reaches_every_pinned_peer_directed_reaches_only_the_subset() {
+        let workdir = tempdir().unwrap();
+        let alice_dir = workdir.path().join("alice");
+        let bob_dir = workdir.path().join("bob");
+        let carol_dir = workdir.path().join("carol");
+        fs::create_dir_all(&alice_dir).unwrap();
+        fs::create_dir_all(&bob_dir).unwrap();
+        fs::create_dir_all(&carol_dir).unwrap();
+
+        let alice = create_identity_session(&alice_dir, "alice-pass").unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let carol = create_identity_session(&carol_dir, "carol-pass").unwrap();
+
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let carol_card = serde_json::to_string(&whoami_card(&carol)).unwrap();
+        add_peer_card(&alice, "bob", &bob_card, false).unwrap();
+        add_peer_card(&alice, "carol", &carol_card, false).unwrap();
+        let bob_key = list_peers_inner(&alice)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.label == "bob")
+            .unwrap()
+            .ed25519_pubkey;
+
+        // Directed: only Bob.
+        post_note_now(
+            &alice,
+            "for bob only".to_string(),
+            1_700_000_000,
+            Some(vec![bob_key]),
+        )
+        .unwrap();
+        let pending = alice.store.pending_sends().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].peer.label, "bob");
     }
 }

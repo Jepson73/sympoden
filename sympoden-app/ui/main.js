@@ -14,6 +14,8 @@ const myCardEl = document.getElementById("my-card");
 const peerLabelInput = document.getElementById("peer-label");
 const peerCardInput = document.getElementById("peer-card");
 const addPeerBtn = document.getElementById("add-peer-btn");
+const peerListEl = document.getElementById("peer-list");
+const recipientListEl = document.getElementById("recipient-list");
 const noteBodyInput = document.getElementById("note-body");
 const postBtn = document.getElementById("post-btn");
 const relayAddrInput = document.getElementById("relay-addr");
@@ -45,15 +47,21 @@ function describeTrust(trust) {
   return { text: "⚠ unknown sender", cssClass: "trust-unknown" };
 }
 
+// Spaced-out grouping already arrives from the engine's format_fingerprint - the
+// frontend never recomputes the hash itself (Slice 03 D5: fingerprinting hashes the
+// key, so it stays a Rust-side computation, not something trivially redone in JS).
+function fingerprintSpan(fingerprint) {
+  return `<span class="fingerprint">${escapeHtml(fingerprint)}</span>`;
+}
+
 async function refreshNotes() {
-  const trustedNotes = await invoke("list_notes");
+  const notes = await invoke("list_notes");
   notesList.innerHTML = "";
-  for (const trusted of trustedNotes) {
-    const note = trusted.note;
-    const { text: trustText, cssClass } = describeTrust(trusted.trust);
+  for (const item of notes) {
+    const { text: trustText, cssClass } = describeTrust(item.trust);
     const li = document.createElement("li");
-    const when = new Date(note.created_at * 1000).toLocaleString();
-    li.innerHTML = `<div>${escapeHtml(note.body)}</div><div class="meta">${when} — <span class="${cssClass}">${escapeHtml(trustText)}</span></div>`;
+    const when = new Date(item.note.created_at * 1000).toLocaleString();
+    li.innerHTML = `<div>${escapeHtml(item.note.body)}</div><div class="meta">${when} — <span class="${cssClass}">${escapeHtml(trustText)}</span> ${fingerprintSpan(item.fingerprint)}</div>`;
     notesList.appendChild(li);
   }
 }
@@ -64,11 +72,82 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+// Outcome of add_peer/relabel_peer's "Outcome" variant - AddPeerOutcome's JSON form is
+// the bare string "Added"/"AlreadyPinned", or {"AlreadyPinnedUnderLabel": {...}} for
+// the loud no-op (Slice 03 Adjustment 3): re-adding an already-pinned key under a new
+// label never silently renames it - relabel is the only way to do that.
+function describeAddPeerOutcome(outcome) {
+  if (outcome === "Added") return "Peer pinned.";
+  if (outcome === "AlreadyPinned") return "Already pinned (no change).";
+  if (outcome && outcome.AlreadyPinnedUnderLabel) {
+    return `Already pinned as "${outcome.AlreadyPinnedUnderLabel.existing_label}" - use relabel to rename, not add-peer.`;
+  }
+  return "Peer pin outcome unrecognized.";
+}
+
+function describeCollision(existing) {
+  return existing.map((p) => `${p.label} (${p.fingerprint})`).join(", ");
+}
+
+async function refreshPeers() {
+  const peers = await invoke("list_peers");
+
+  peerListEl.innerHTML = "";
+  recipientListEl.innerHTML = "";
+
+  for (const peer of peers) {
+    const li = document.createElement("li");
+    li.innerHTML = `${escapeHtml(peer.label)} ${fingerprintSpan(peer.fingerprint)}
+      <span class="relabel-form">
+        <input type="text" placeholder="new label" data-relabel-for="${escapeHtml(peer.ed25519_pubkey)}" />
+        <button data-relabel-btn-for="${escapeHtml(peer.ed25519_pubkey)}">Rename</button>
+      </span>`;
+    peerListEl.appendChild(li);
+
+    const recipientLi = document.createElement("li");
+    const checkboxId = `recipient-${peer.ed25519_pubkey}`;
+    recipientLi.innerHTML = `<label><input type="checkbox" id="${checkboxId}" data-recipient-key="${escapeHtml(peer.ed25519_pubkey)}" checked /> ${escapeHtml(peer.label)} ${fingerprintSpan(peer.fingerprint)}</label>`;
+    recipientListEl.appendChild(recipientLi);
+  }
+
+  for (const button of peerListEl.querySelectorAll("[data-relabel-btn-for]")) {
+    button.addEventListener("click", async () => {
+      const key = button.getAttribute("data-relabel-btn-for");
+      const input = peerListEl.querySelector(`[data-relabel-for="${key}"]`);
+      const newLabel = input.value.trim();
+      if (!newLabel) return;
+      await doRelabel(key, newLabel);
+    });
+  }
+}
+
+async function doRelabel(query, newLabel, confirmCollision) {
+  try {
+    const result = await invoke("relabel_peer", {
+      query,
+      newLabel,
+      confirmCollision: !!confirmCollision,
+    });
+    if (result.NeedsCollisionConfirmation) {
+      const existing = result.NeedsCollisionConfirmation.existing;
+      if (confirm(`"${newLabel}" is already used by: ${describeCollision(existing)}. Rename anyway?`)) {
+        await doRelabel(query, newLabel, true);
+      }
+      return;
+    }
+    showStatus(`Relabeled to "${newLabel}".`, false);
+    await refreshPeers();
+  } catch (err) {
+    showStatus(String(err), true);
+  }
+}
+
 async function enterApp() {
   unlockSection.classList.add("hidden");
   appSection.classList.remove("hidden");
   const card = await invoke("whoami");
   myCardEl.value = btoa(card);
+  await refreshPeers();
   await refreshNotes();
 }
 
@@ -99,12 +178,24 @@ createBtn.addEventListener("click", async () => {
   }
 });
 
+async function doAddPeer(label, card, confirmCollision) {
+  const result = await invoke("add_peer", { label, card, confirmCollision: !!confirmCollision });
+  if (result.NeedsCollisionConfirmation) {
+    const existing = result.NeedsCollisionConfirmation.existing;
+    if (confirm(`"${label}" is already used by: ${describeCollision(existing)}. Pin this as a second, different peer anyway?`)) {
+      return doAddPeer(label, card, true);
+    }
+    showStatus("Add-peer cancelled.", false);
+    return;
+  }
+  showStatus(describeAddPeerOutcome(result.Outcome), false);
+  await refreshPeers();
+}
+
 addPeerBtn.addEventListener("click", async () => {
   try {
     const decoded = atob(peerCardInput.value.trim());
-    await invoke("add_peer", { label: peerLabelInput.value.trim(), card: decoded });
-    showStatus("Peer added.", false);
-    await refreshNotes();
+    await doAddPeer(peerLabelInput.value.trim(), decoded, false);
   } catch (err) {
     showStatus(String(err), true);
   }
@@ -112,7 +203,14 @@ addPeerBtn.addEventListener("click", async () => {
 
 postBtn.addEventListener("click", async () => {
   try {
-    await invoke("post_note", { body: noteBodyInput.value });
+    const checkboxes = [...recipientListEl.querySelectorAll("[data-recipient-key]")];
+    const checked = checkboxes.filter((cb) => cb.checked).map((cb) => cb.getAttribute("data-recipient-key"));
+    // All checked (the default, and the common case with no peers yet) is exactly a
+    // broadcast - send `recipients: undefined` rather than the full list, so the
+    // common path matches the engine's own Broadcast target instead of happening to
+    // enumerate the same set directedly.
+    const recipients = checked.length === checkboxes.length ? undefined : checked;
+    await invoke("post_note", { body: noteBodyInput.value, recipients });
     noteBodyInput.value = "";
     showStatus("Posted.", false);
     await refreshNotes();
