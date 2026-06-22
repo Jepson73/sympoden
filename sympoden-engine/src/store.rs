@@ -1,22 +1,30 @@
-//! Local encrypted store: SQLite + SQLCipher, a `notes` table and a `peers` table.
+//! Local encrypted store: SQLite + SQLCipher, a `notes` table, a `peers` table, and a
+//! `note_sends` table.
 //!
 //! The `notes` schema is exactly the table Slice 01 specifies — `(id, author_pubkey,
-//! body, created_at, signature)` — plus one bookkeeping column, `synced_at`, needed to
-//! avoid re-pushing a note that's already on the relay. Incoming notes are deduplicated
-//! by their content-addressed `id` instead.
+//! body, created_at, signature)` — plus one bookkeeping column, `synced_at`, which
+//! Slice 03 no longer reads or writes (see SLICE-03.md's "honest leftover": it stays
+//! only because `content.rs::to_stored()` sets it and is held at zero diff this slice).
+//! Incoming notes are deduplicated by their content-addressed `id`.
 //!
-//! The `peers` table (Slice 02) holds trust-on-first-use pins: a label and the two
-//! pinned public keys (hex, matching `notes.author_pubkey`'s encoding) plus a first-seen
-//! timestamp. It is schema-shaped to hold a set, but Slice 02 enforces at most one row
-//! at a time (see `add_peer`) — see `docs/slices/SLICE-02.md` D2 for why.
+//! The `peers` table (Slice 02) holds trust-on-first-use pins. As of Slice 03 it is
+//! re-keyed on the public key, not the label (see SLICE-03.md D1): `ed25519_pubkey TEXT
+//! PRIMARY KEY, x25519_pubkey TEXT NOT NULL, label TEXT NOT NULL, first_seen INTEGER NOT
+//! NULL`. A label is a non-unique, user-chosen annotation on a key, never the other way
+//! around.
+//!
+//! The `note_sends` table (Slice 03, new) tracks delivery per `(note, recipient key)` —
+//! see SLICE-03.md D7. It is the sole source of truth for what's been pushed to whom;
+//! `notes.synced_at` is not consulted.
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::StoreError;
+use crate::identity::fingerprint_hex;
 
 pub struct Store {
     conn: Connection,
@@ -32,16 +40,50 @@ pub struct StoredNote {
     pub synced_at: Option<i64>,
 }
 
-/// A trust-on-first-use pin: a local label bound to the two public keys from a peer's
-/// card, plus when it was first pinned. Both keys are hex, matching `StoredNote`'s
-/// `author_pubkey` encoding, so comparing a note's author against a pin is a plain
-/// string (or decoded-byte) comparison with no encoding mismatch to get wrong.
+/// A trust-on-first-use pin: a key (the peer's actual identity, Slice 03 D1) plus a
+/// local, non-unique label and when it was first pinned. Keys are hex, matching
+/// `StoredNote`'s `author_pubkey` encoding, so comparing a note's author against a pin
+/// is a plain string (or decoded-byte) comparison with no encoding mismatch to get
+/// wrong.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedPeer {
     pub label: String,
-    pub ed25519_pubkey: String, // hex
+    pub ed25519_pubkey: String, // hex - the peer's identity (primary key in `peers`)
     pub x25519_pubkey: String,  // hex
     pub first_seen: i64,        // unix seconds
+}
+
+/// What pinning a key actually did. See SLICE-03.md D2/Adjustment 1: there is no
+/// X25519 comparison anywhere in `add_peer` - only whether this Ed25519 key, and
+/// (if so) this exact label, were already on file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum AddPeerOutcome {
+    /// A new key, pinned under `label`.
+    Added,
+    /// This exact `(ed25519_pubkey, label)` was already pinned - a silent no-op.
+    AlreadyPinned,
+    /// This `ed25519_pubkey` was already pinned, but under a *different* label. The
+    /// data is unchanged (the stored label does not move) - this is a loud no-op, not
+    /// a silent one: `relabel_peer` is the only function that changes a label.
+    AlreadyPinnedUnderLabel { existing_label: String },
+}
+
+/// Who a posted note is addressed to. `Broadcast` resolves to every currently-pinned
+/// key at the moment `record_pending_sends` runs, not live thereafter (SLICE-03.md D3/
+/// Known Limitation h). `Directed` holds already-resolved `ed25519_pubkey` hex strings;
+/// resolving a user-typed label/fingerprint query to a key is the caller's job
+/// (`resolve_peer_query`), not this type's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendTargets {
+    Broadcast,
+    Directed(Vec<String>),
+}
+
+/// One pending `(note, recipient)` delivery: a note still owed to a pinned peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSend {
+    pub note: StoredNote,
+    pub peer: PinnedPeer,
 }
 
 impl Store {
@@ -74,10 +116,16 @@ impl Store {
                 synced_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS peers (
-                label TEXT PRIMARY KEY,
-                ed25519_pubkey TEXT NOT NULL,
+                ed25519_pubkey TEXT PRIMARY KEY,
                 x25519_pubkey TEXT NOT NULL,
+                label TEXT NOT NULL,
                 first_seen INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS note_sends (
+                note_id TEXT NOT NULL,
+                peer_key TEXT NOT NULL,
+                pushed_at INTEGER,
+                PRIMARY KEY (note_id, peer_key)
             );",
         )?;
 
@@ -102,32 +150,6 @@ impl Store {
         Ok(())
     }
 
-    /// Mark a note as pushed to the relay.
-    pub fn mark_synced(&self, id: &str, synced_at: i64) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE notes SET synced_at = ?1 WHERE id = ?2",
-            params![synced_at, id],
-        )?;
-        Ok(())
-    }
-
-    /// This identity's own notes that haven't been pushed to the relay yet.
-    ///
-    /// The `author_pubkey = ?1` clause is a correctness guard, not an optimization:
-    /// received (foreign-authored) notes are stored with `synced_at = NULL` too (see
-    /// `insert_note`), so without this filter sync would re-push someone else's note
-    /// back to the relay under our own routing key. Do not loosen or drop it.
-    pub fn unsynced_own_notes(&self, my_pubkey_hex: &str) -> Result<Vec<StoredNote>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, author_pubkey, body, created_at, signature, synced_at
-             FROM notes WHERE author_pubkey = ?1 AND synced_at IS NULL
-             ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map(params![my_pubkey_hex], Self::row_to_note)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
-    }
-
     /// All locally stored notes, oldest first.
     pub fn list_notes(&self) -> Result<Vec<StoredNote>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -150,61 +172,245 @@ impl Store {
         })
     }
 
-    /// Pin `label` to the given keys. Trust-on-first-use: succeeds and persists the pin
-    /// if `label` is new (and no other peer is configured - this slice enforces a single
-    /// correspondent, see SLICE-02 D2); is a no-op success if `label` already exists with
-    /// these exact keys; and is rejected with a typed error - never a silent overwrite -
-    /// if `label` exists with *different* keys, or if a *different* label is already
-    /// configured.
+    /// Pin `ed25519_pubkey` under `label`. Key-as-identity (SLICE-03.md D1/D2): there is
+    /// no comparison against any *other* peer's key or label here - that's
+    /// `check_label_collision`, run by the caller beforehand if it cares (D3). The only
+    /// question this function answers is whether *this* key was already on file:
+    /// new key -> `Added`; same key, same label -> `AlreadyPinned` (silent no-op); same
+    /// key, different label -> `AlreadyPinnedUnderLabel` (loud no-op - the label does
+    /// not change; `relabel_peer` is the only function that changes one).
     pub fn add_peer(
         &self,
         label: &str,
         ed25519_pubkey: &str,
         x25519_pubkey: &str,
         first_seen: i64,
-    ) -> Result<(), StoreError> {
-        let existing = self.list_peers()?;
-
-        if let Some(peer) = existing.iter().find(|p| p.label == label) {
-            if peer.ed25519_pubkey == ed25519_pubkey && peer.x25519_pubkey == x25519_pubkey {
-                return Ok(());
-            }
-            return Err(StoreError::PeerKeyMismatch {
-                label: label.to_string(),
-            });
-        }
-
-        if let Some(other) = existing.first() {
-            return Err(StoreError::PeerAlreadyConfigured {
-                existing_label: other.label.clone(),
+    ) -> Result<AddPeerOutcome, StoreError> {
+        if let Some(existing) = self.get_peer_by_key(ed25519_pubkey)? {
+            return Ok(if existing.label == label {
+                AddPeerOutcome::AlreadyPinned
+            } else {
+                AddPeerOutcome::AlreadyPinnedUnderLabel {
+                    existing_label: existing.label,
+                }
             });
         }
 
         self.conn.execute(
-            "INSERT INTO peers (label, ed25519_pubkey, x25519_pubkey, first_seen)
+            "INSERT INTO peers (ed25519_pubkey, x25519_pubkey, label, first_seen)
              VALUES (?1, ?2, ?3, ?4)",
-            params![label, ed25519_pubkey, x25519_pubkey, first_seen],
+            params![ed25519_pubkey, x25519_pubkey, label, first_seen],
         )?;
+        Ok(AddPeerOutcome::Added)
+    }
+
+    /// The pinned peer with this exact key, if any.
+    pub fn get_peer_by_key(&self, ed25519_pubkey: &str) -> Result<Option<PinnedPeer>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT label, ed25519_pubkey, x25519_pubkey, first_seen
+                 FROM peers WHERE ed25519_pubkey = ?1",
+                params![ed25519_pubkey],
+                Self::row_to_peer,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Every *other* pinned peer (a different key) already using `label`. Empty means
+    /// no collision. Used as a pre-check by callers (CLI/app) before deciding whether
+    /// to warn-and-proceed or refuse on `add_peer`/`relabel_peer` (SLICE-03.md D3) - this
+    /// function never refuses anything itself, it only reports.
+    pub fn check_label_collision(
+        &self,
+        label: &str,
+        ed25519_pubkey: &str,
+    ) -> Result<Vec<PinnedPeer>, StoreError> {
+        Ok(self
+            .list_peers()?
+            .into_iter()
+            .filter(|p| p.label == label && p.ed25519_pubkey != ed25519_pubkey)
+            .collect())
+    }
+
+    /// Change a pinned peer's label, addressed by key. Never touches
+    /// `ed25519_pubkey` or `x25519_pubkey` - there is no function anywhere in this
+    /// module that mutates an existing peer's key (SLICE-03.md D4). Errors with
+    /// `UnknownPeerKey` if no peer has this key.
+    pub fn relabel_peer(&self, ed25519_pubkey: &str, new_label: &str) -> Result<(), StoreError> {
+        let rows = self.conn.execute(
+            "UPDATE peers SET label = ?1 WHERE ed25519_pubkey = ?2",
+            params![new_label, ed25519_pubkey],
+        )?;
+        if rows == 0 {
+            return Err(StoreError::UnknownPeerKey {
+                query: ed25519_pubkey.to_string(),
+            });
+        }
         Ok(())
     }
 
-    /// All pinned peers. Typed as a `Vec` (rather than `Option<PinnedPeer>`) so the
-    /// shape survives Phase 1's real multi-peer work without a second migration, even
-    /// though this slice's `add_peer` enforces at most one row.
+    /// All pinned peers, sorted by label then first-pinned, so same-labeled peers sort
+    /// adjacent for display.
     pub fn list_peers(&self) -> Result<Vec<PinnedPeer>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT label, ed25519_pubkey, x25519_pubkey, first_seen FROM peers
-             ORDER BY first_seen ASC",
+             ORDER BY label ASC, first_seen ASC",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_peer)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    fn row_to_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PinnedPeer> {
+        Ok(PinnedPeer {
+            label: row.get(0)?,
+            ed25519_pubkey: row.get(1)?,
+            x25519_pubkey: row.get(2)?,
+            first_seen: row.get(3)?,
+        })
+    }
+
+    /// Record which peer(s) a freshly-posted note is addressed to. Must be called, and
+    /// must succeed, *before* `insert_note` (SLICE-03.md D7): a `Directed` target that
+    /// doesn't resolve to a pinned key is rejected here, before the note exists, so a
+    /// bad target never leaves an orphaned, unaddressed note behind.
+    pub fn record_pending_sends(
+        &self,
+        note_id: &str,
+        targets: &SendTargets,
+    ) -> Result<(), StoreError> {
+        let keys: Vec<String> = match targets {
+            SendTargets::Broadcast => self
+                .list_peers()?
+                .into_iter()
+                .map(|p| p.ed25519_pubkey)
+                .collect(),
+            SendTargets::Directed(keys) => {
+                let pinned = self.list_peers()?;
+                for key in keys {
+                    if !pinned.iter().any(|p| &p.ed25519_pubkey == key) {
+                        return Err(StoreError::UnknownPeerKey { query: key.clone() });
+                    }
+                }
+                keys.clone()
+            }
+        };
+
+        for key in &keys {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO note_sends (note_id, peer_key, pushed_at)
+                 VALUES (?1, ?2, NULL)",
+                params![note_id, key],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every `(note, recipient)` pair still owed a push, oldest note first. Joins
+    /// against `notes` and `peers` so the caller (the sync push loop) needs no further
+    /// lookups per row.
+    pub fn pending_sends(&self) -> Result<Vec<PendingSend>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id, n.author_pubkey, n.body, n.created_at, n.signature, n.synced_at,
+                    p.label, p.ed25519_pubkey, p.x25519_pubkey, p.first_seen
+             FROM note_sends s
+             JOIN notes n ON n.id = s.note_id
+             JOIN peers p ON p.ed25519_pubkey = s.peer_key
+             WHERE s.pushed_at IS NULL
+             ORDER BY n.created_at ASC, p.ed25519_pubkey ASC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(PinnedPeer {
-                label: row.get(0)?,
-                ed25519_pubkey: row.get(1)?,
-                x25519_pubkey: row.get(2)?,
-                first_seen: row.get(3)?,
+            Ok(PendingSend {
+                note: StoredNote {
+                    id: row.get(0)?,
+                    author_pubkey: row.get(1)?,
+                    body: row.get(2)?,
+                    created_at: row.get(3)?,
+                    signature: row.get(4)?,
+                    synced_at: row.get(5)?,
+                },
+                peer: PinnedPeer {
+                    label: row.get(6)?,
+                    ed25519_pubkey: row.get(7)?,
+                    x25519_pubkey: row.get(8)?,
+                    first_seen: row.get(9)?,
+                },
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Mark one `(note, recipient)` pair as handed to the relay. After this, that pair
+    /// no longer appears in `pending_sends` - it is never re-pushed.
+    pub fn mark_send_pushed(
+        &self,
+        note_id: &str,
+        peer_key: &str,
+        pushed_at: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE note_sends SET pushed_at = ?1 WHERE note_id = ?2 AND peer_key = ?3",
+            params![pushed_at, note_id, peer_key],
+        )?;
+        Ok(())
+    }
+}
+
+/// Resolve a user-typed recipient/relabel-target query against the current peer list.
+/// Pure (`&[PinnedPeer]` in, no I/O) - identical logic for the CLI's `--to`/
+/// `relabel-peer` and the app's recipient picker (SLICE-03.md D6).
+///
+/// Tried in order: (1) `label#fingerprint` - exact match on both; (2) a bare label that
+/// uniquely matches exactly one peer - tried *before* fingerprint, so a label that
+/// happens to look like a fingerprint still resolves as a label first; (3) a bare
+/// fingerprint, tried only if (2) found no label match at all. No match anywhere ->
+/// `UnknownPeerKey`; more than one match at the same step -> `AmbiguousPeerQuery`.
+pub fn resolve_peer_query<'a>(
+    query: &str,
+    peers: &'a [PinnedPeer],
+) -> Result<&'a PinnedPeer, StoreError> {
+    if let Some((label, fp)) = query.split_once('#') {
+        let matches: Vec<&PinnedPeer> = peers
+            .iter()
+            .filter(|p| p.label == label && fingerprint_hex(&p.ed25519_pubkey) == fp)
+            .collect();
+        return match matches.len() {
+            1 => Ok(matches[0]),
+            0 => Err(StoreError::UnknownPeerKey {
+                query: query.to_string(),
+            }),
+            _ => Err(StoreError::AmbiguousPeerQuery {
+                query: query.to_string(),
+                candidates: matches.into_iter().cloned().collect(),
+            }),
+        };
+    }
+
+    let label_matches: Vec<&PinnedPeer> = peers.iter().filter(|p| p.label == query).collect();
+    match label_matches.len() {
+        1 => return Ok(label_matches[0]),
+        n if n > 1 => {
+            return Err(StoreError::AmbiguousPeerQuery {
+                query: query.to_string(),
+                candidates: label_matches.into_iter().cloned().collect(),
+            });
+        }
+        _ => {}
+    }
+
+    let fp_matches: Vec<&PinnedPeer> = peers
+        .iter()
+        .filter(|p| fingerprint_hex(&p.ed25519_pubkey) == query)
+        .collect();
+    match fp_matches.len() {
+        1 => Ok(fp_matches[0]),
+        0 => Err(StoreError::UnknownPeerKey {
+            query: query.to_string(),
+        }),
+        _ => Err(StoreError::AmbiguousPeerQuery {
+            query: query.to_string(),
+            candidates: fp_matches.into_iter().cloned().collect(),
+        }),
     }
 }
 
@@ -258,44 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn mark_synced_excludes_note_from_unsynced_query() {
-        let dir = tempdir().unwrap();
-        let key = [7u8; 32];
-        let store = Store::open(&dir.path().join("notes.sqlite"), &key).unwrap();
-
-        store
-            .insert_note(&sample_note("id1", "alice", None))
-            .unwrap();
-        assert_eq!(store.unsynced_own_notes("alice").unwrap().len(), 1);
-
-        store.mark_synced("id1", 1_700_000_100).unwrap();
-        assert_eq!(store.unsynced_own_notes("alice").unwrap().len(), 0);
-        assert_eq!(
-            store.list_notes().unwrap()[0].synced_at,
-            Some(1_700_000_100)
-        );
-    }
-
-    #[test]
-    fn unsynced_own_notes_excludes_other_authors_and_already_synced() {
-        let dir = tempdir().unwrap();
-        let key = [7u8; 32];
-        let store = Store::open(&dir.path().join("notes.sqlite"), &key).unwrap();
-
-        store
-            .insert_note(&sample_note("id1", "alice", None))
-            .unwrap();
-        store.insert_note(&sample_note("id2", "bob", None)).unwrap();
-        store
-            .insert_note(&sample_note("id3", "alice", Some(1)))
-            .unwrap();
-
-        let pending = store.unsynced_own_notes("alice").unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, "id1");
-    }
-
-    #[test]
     fn wrong_key_fails_cleanly_on_existing_database() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("notes.sqlite");
@@ -341,9 +509,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
 
-        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
-        let peers = store.list_peers().unwrap();
+        let outcome = store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        assert_eq!(outcome, AddPeerOutcome::Added);
 
+        let peers = store.list_peers().unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].label, "bob");
         assert_eq!(peers[0].ed25519_pubkey, "ed-bob");
@@ -356,42 +525,68 @@ mod tests {
         let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
 
         store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
-        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_500).unwrap();
+        let outcome = store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_500).unwrap();
 
+        assert_eq!(outcome, AddPeerOutcome::AlreadyPinned);
         assert_eq!(store.list_peers().unwrap().len(), 1);
     }
 
     #[test]
-    fn add_peer_rejects_a_changed_key_under_the_same_label() {
+    fn add_peer_with_an_already_pinned_key_under_a_different_label_is_a_loud_no_op() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
 
         store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
-        let result = store.add_peer("bob", "ed-bob-NEW", "x-bob", 1_700_000_500);
+        let outcome = store
+            .add_peer("robert", "ed-bob", "x-bob-different", 1_700_000_500)
+            .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(StoreError::PeerKeyMismatch { label }) if label == "bob"
-        ));
-        // The original pin must survive a rejected re-pin attempt untouched.
+        assert_eq!(
+            outcome,
+            AddPeerOutcome::AlreadyPinnedUnderLabel {
+                existing_label: "bob".to_string()
+            }
+        );
+        // The label - and the rest of the row - must not have changed. In particular,
+        // there is no X25519 comparison/update at all (Adjustment 1): the differing
+        // x25519_pubkey passed above is silently ignored, not written.
         let peers = store.list_peers().unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].ed25519_pubkey, "ed-bob");
+        assert_eq!(peers[0].label, "bob");
+        assert_eq!(peers[0].x25519_pubkey, "x-bob");
     }
 
     #[test]
-    fn add_peer_rejects_a_second_distinct_label() {
+    fn add_peer_under_a_second_distinct_label_succeeds_the_cap_is_gone() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
 
         store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
-        let result = store.add_peer("carol", "ed-carol", "x-carol", 1_700_000_500);
+        let outcome = store
+            .add_peer("carol", "ed-carol", "x-carol", 1_700_000_500)
+            .unwrap();
+        assert_eq!(outcome, AddPeerOutcome::Added);
 
-        assert!(matches!(
-            result,
-            Err(StoreError::PeerAlreadyConfigured { existing_label }) if existing_label == "bob"
-        ));
-        assert_eq!(store.list_peers().unwrap().len(), 1);
+        let third = store
+            .add_peer("dave", "ed-dave", "x-dave", 1_700_001_000)
+            .unwrap();
+        assert_eq!(third, AddPeerOutcome::Added);
+
+        assert_eq!(store.list_peers().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn add_peer_under_a_label_another_peer_already_uses_succeeds_a_collision_not_a_cap() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("alice", "ed-alice-real", "x-alice-real", 1_700_000_000).unwrap();
+        let outcome = store
+            .add_peer("alice", "ed-alice-impostor", "x-alice-impostor", 1_700_000_500)
+            .unwrap();
+
+        assert_eq!(outcome, AddPeerOutcome::Added);
+        assert_eq!(store.list_peers().unwrap().len(), 2);
     }
 
     #[test]
@@ -400,5 +595,251 @@ mod tests {
         let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
 
         assert_eq!(store.list_peers().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn check_label_collision_excludes_the_same_key_and_finds_others() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("alice", "ed-alice-real", "x-alice-real", 1_700_000_000).unwrap();
+
+        // Re-checking the same key under the same label: not a collision with itself.
+        assert_eq!(
+            store.check_label_collision("alice", "ed-alice-real").unwrap(),
+            Vec::new()
+        );
+
+        // A different key proposing the same label: a real collision.
+        let collisions = store
+            .check_label_collision("alice", "ed-alice-impostor")
+            .unwrap();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].ed25519_pubkey, "ed-alice-real");
+    }
+
+    #[test]
+    fn relabel_peer_changes_the_label_not_the_key() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("alice-impostor", "ed-eve", "x-eve", 1_700_000_000).unwrap();
+        store.relabel_peer("ed-eve", "eve").unwrap();
+
+        let peer = store.get_peer_by_key("ed-eve").unwrap().unwrap();
+        assert_eq!(peer.label, "eve");
+        assert_eq!(peer.ed25519_pubkey, "ed-eve");
+        assert_eq!(peer.x25519_pubkey, "x-eve");
+    }
+
+    #[test]
+    fn relabel_peer_rejects_an_unknown_key() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        let result = store.relabel_peer("ed-nobody", "anyone");
+        assert!(matches!(
+            result,
+            Err(StoreError::UnknownPeerKey { query }) if query == "ed-nobody"
+        ));
+    }
+
+    #[test]
+    fn resolve_peer_query_finds_a_unique_label() {
+        let peers = vec![PinnedPeer {
+            label: "bob".to_string(),
+            ed25519_pubkey: "ed-bob".to_string(),
+            x25519_pubkey: "x-bob".to_string(),
+            first_seen: 1_700_000_000,
+        }];
+        let resolved = resolve_peer_query("bob", &peers).unwrap();
+        assert_eq!(resolved.ed25519_pubkey, "ed-bob");
+    }
+
+    #[test]
+    fn resolve_peer_query_is_ambiguous_on_a_shared_label() {
+        let peers = vec![
+            PinnedPeer {
+                label: "alice".to_string(),
+                ed25519_pubkey: "ed-alice-real".to_string(),
+                x25519_pubkey: "x-alice-real".to_string(),
+                first_seen: 1_700_000_000,
+            },
+            PinnedPeer {
+                label: "alice".to_string(),
+                ed25519_pubkey: "ed-alice-impostor".to_string(),
+                x25519_pubkey: "x-alice-impostor".to_string(),
+                first_seen: 1_700_000_500,
+            },
+        ];
+        let result = resolve_peer_query("alice", &peers);
+        assert!(matches!(
+            result,
+            Err(StoreError::AmbiguousPeerQuery { candidates, .. }) if candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn resolve_peer_query_disambiguates_via_label_hash_fingerprint() {
+        // fingerprint_hex falls back to a fixed value for non-hex input (so it never
+        // panics on a malformed key) - which means two *non-hex* placeholder keys would
+        // collapse to the same fingerprint and defeat this very test. Use real hex.
+        let peers = vec![
+            PinnedPeer {
+                label: "alice".to_string(),
+                ed25519_pubkey: "aa".repeat(32),
+                x25519_pubkey: "x-alice-real".to_string(),
+                first_seen: 1_700_000_000,
+            },
+            PinnedPeer {
+                label: "alice".to_string(),
+                ed25519_pubkey: "bb".repeat(32),
+                x25519_pubkey: "x-alice-impostor".to_string(),
+                first_seen: 1_700_000_500,
+            },
+        ];
+        let fp = fingerprint_hex(&"bb".repeat(32));
+        let query = format!("alice#{fp}");
+        let resolved = resolve_peer_query(&query, &peers).unwrap();
+        assert_eq!(resolved.ed25519_pubkey, "bb".repeat(32));
+    }
+
+    #[test]
+    fn resolve_peer_query_returns_unknown_peer_key_when_nothing_matches() {
+        let peers = vec![PinnedPeer {
+            label: "bob".to_string(),
+            ed25519_pubkey: "ed-bob".to_string(),
+            x25519_pubkey: "x-bob".to_string(),
+            first_seen: 1_700_000_000,
+        }];
+        let result = resolve_peer_query("nobody", &peers);
+        assert!(matches!(
+            result,
+            Err(StoreError::UnknownPeerKey { query }) if query == "nobody"
+        ));
+    }
+
+    /// Regression guard for SLICE-03.md D6's precedence rule: a peer's *label*
+    /// happening to look exactly like a *different* peer's fingerprint must not cause
+    /// the label query to resolve to the wrong peer via a coincidental fingerprint
+    /// match. Label match is tried first and must win outright.
+    #[test]
+    fn resolve_peer_query_prefers_an_exact_label_match_over_a_coincidental_fingerprint_clash() {
+        let other_fp = fingerprint_hex("ed-someone-else");
+        let peers = vec![
+            PinnedPeer {
+                label: other_fp.clone(),
+                ed25519_pubkey: "ed-labeled-like-a-fingerprint".to_string(),
+                x25519_pubkey: "x-1".to_string(),
+                first_seen: 1_700_000_000,
+            },
+            PinnedPeer {
+                label: "someone-else".to_string(),
+                ed25519_pubkey: "ed-someone-else".to_string(),
+                x25519_pubkey: "x-2".to_string(),
+                first_seen: 1_700_000_500,
+            },
+        ];
+
+        let resolved = resolve_peer_query(&other_fp, &peers).unwrap();
+        assert_eq!(resolved.ed25519_pubkey, "ed-labeled-like-a-fingerprint");
+    }
+
+    #[test]
+    fn record_pending_sends_broadcast_targets_every_pinned_peer() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.add_peer("carol", "ed-carol", "x-carol", 1_700_000_500).unwrap();
+        store.insert_note(&sample_note("note1", "me", None)).unwrap();
+
+        store
+            .record_pending_sends("note1", &SendTargets::Broadcast)
+            .unwrap();
+
+        let pending = store.pending_sends().unwrap();
+        assert_eq!(pending.len(), 2);
+        let mut recipients: Vec<String> = pending.iter().map(|p| p.peer.ed25519_pubkey.clone()).collect();
+        recipients.sort();
+        assert_eq!(recipients, vec!["ed-bob".to_string(), "ed-carol".to_string()]);
+    }
+
+    #[test]
+    fn record_pending_sends_directed_targets_only_the_named_keys() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.add_peer("carol", "ed-carol", "x-carol", 1_700_000_500).unwrap();
+        store.insert_note(&sample_note("note1", "me", None)).unwrap();
+
+        store
+            .record_pending_sends("note1", &SendTargets::Directed(vec!["ed-bob".to_string()]))
+            .unwrap();
+
+        let pending = store.pending_sends().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].peer.ed25519_pubkey, "ed-bob");
+    }
+
+    #[test]
+    fn record_pending_sends_rejects_an_unpinned_directed_target_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.insert_note(&sample_note("note1", "me", None)).unwrap();
+
+        let result = store.record_pending_sends(
+            "note1",
+            &SendTargets::Directed(vec!["ed-bob".to_string(), "ed-nobody".to_string()]),
+        );
+        assert!(matches!(
+            result,
+            Err(StoreError::UnknownPeerKey { query }) if query == "ed-nobody"
+        ));
+        // Nothing partial was written - not even the valid "ed-bob" target.
+        assert_eq!(store.pending_sends().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn mark_send_pushed_removes_the_row_from_pending_sends() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.add_peer("carol", "ed-carol", "x-carol", 1_700_000_500).unwrap();
+        store.insert_note(&sample_note("note1", "me", None)).unwrap();
+        store
+            .record_pending_sends("note1", &SendTargets::Broadcast)
+            .unwrap();
+
+        store.mark_send_pushed("note1", "ed-bob", 1_700_001_000).unwrap();
+
+        let pending = store.pending_sends().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].peer.ed25519_pubkey, "ed-carol");
+    }
+
+    #[test]
+    fn pending_sends_does_not_resurrect_a_pushed_row_on_a_later_call() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.insert_note(&sample_note("note1", "me", None)).unwrap();
+        store
+            .record_pending_sends("note1", &SendTargets::Broadcast)
+            .unwrap();
+        store.mark_send_pushed("note1", "ed-bob", 1_700_001_000).unwrap();
+
+        assert_eq!(store.pending_sends().unwrap().len(), 0);
+        // Calling record_pending_sends again for the same note/target must not
+        // resurrect it (INSERT OR IGNORE - the row already exists, now pushed).
+        store
+            .record_pending_sends("note1", &SendTargets::Broadcast)
+            .unwrap();
+        assert_eq!(store.pending_sends().unwrap().len(), 0);
     }
 }

@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::store::PinnedPeer;
+
 /// Errors from the `identity` module: keyfile creation, unlock, and persistence.
 #[derive(Debug, Error)]
 pub enum IdentityError {
@@ -33,14 +35,13 @@ pub enum StoreError {
     InvalidKey,
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
-    #[error(
-        "a peer is already configured as \"{existing_label}\" - this slice supports only one peer"
-    )]
-    PeerAlreadyConfigured { existing_label: String },
-    #[error(
-        "\"{label}\" is already pinned to a different key - refusing to silently re-pin"
-    )]
-    PeerKeyMismatch { label: String },
+    #[error("no pinned peer matches \"{query}\"")]
+    UnknownPeerKey { query: String },
+    #[error("\"{query}\" matches more than one pinned peer - specify by label#fingerprint")]
+    AmbiguousPeerQuery {
+        query: String,
+        candidates: Vec<PinnedPeer>,
+    },
 }
 
 /// Errors from the `content` module: parsing/validating a note's wire format.

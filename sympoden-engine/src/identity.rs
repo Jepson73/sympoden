@@ -24,6 +24,18 @@ const NONCE_LEN: usize = 12;
 const SEALED_PLAINTEXT_LEN: usize = 32 /* ed25519 seed */ + 32 /* x25519 secret */;
 const KEYFILE_VERSION: u8 = 1;
 
+/// Domain-separates the display fingerprint's hash from `crypto::routing_key_for`'s
+/// hash of the same key — they're unrelated concerns (a human-facing disambiguation aid
+/// vs. a protocol-level routing address) that happen to both be SHA-256 of an Ed25519
+/// key; tagging keeps a future change to one from silently changing the other. Mirrors
+/// `content.rs`'s `DOMAIN_TAG` pattern for signed bytes.
+const FINGERPRINT_DOMAIN_TAG: &[u8] = b"sympoden-fingerprint-v1\0";
+
+/// 80 bits (SLICE-03.md D5/Adjustment 2): a slice of an already-computed hash, so the
+/// extra bits over a shorter prefix cost nothing in compute or storage. Used uniformly
+/// everywhere a fingerprint is shown — there is no shorter "casual" tier.
+pub const FINGERPRINT_HEX_LEN: usize = 20;
+
 // Bounds on the Argon2id parameters read from an on-disk keyfile. The keyfile is
 // local user data, but it can still be hand-edited, corrupted, or (via backup/
 // restore/import in a later phase) come from somewhere less trusted than "this
@@ -337,6 +349,37 @@ impl PublicCard {
     }
 }
 
+/// A short, stable, human-comparable fingerprint for an Ed25519 public key, given as
+/// hex (matching `PinnedPeer::ed25519_pubkey`/`StoredNote::author_pubkey`'s encoding).
+/// `FINGERPRINT_HEX_LEN` hex characters of `SHA-256(FINGERPRINT_DOMAIN_TAG ||
+/// raw_key_bytes)` — a domain-separated hash, not a slice of the raw key (SLICE-03.md
+/// D5). Calls `crypto::content_address`, an existing exported function, rather than
+/// hashing inline — `crypto.rs` itself is held at zero diff this slice.
+///
+/// Infallible by design: a malformed `ed25519_pubkey_hex` (which should never happen —
+/// every caller already has a key that round-tripped through `hex::encode`) falls back
+/// to hashing nothing, rather than panicking on an engine path.
+pub fn fingerprint_hex(ed25519_pubkey_hex: &str) -> String {
+    let key_bytes = hex::decode(ed25519_pubkey_hex).unwrap_or_default();
+    let mut tagged = Vec::with_capacity(FINGERPRINT_DOMAIN_TAG.len() + key_bytes.len());
+    tagged.extend_from_slice(FINGERPRINT_DOMAIN_TAG);
+    tagged.extend_from_slice(&key_bytes);
+    let hash = crate::crypto::content_address(&tagged);
+    hex::encode(hash)[..FINGERPRINT_HEX_LEN].to_string()
+}
+
+/// Group a fingerprint into fours for eyeball comparison, e.g.
+/// `"a1b2c3d4e5f60718293a"` -> `"a1b2 c3d4 e5f6 0718 293a"`. Display-only; the raw,
+/// ungrouped form from `fingerprint_hex` is what `resolve_peer_query` matches against.
+pub fn format_fingerprint(fingerprint_hex: &str) -> String {
+    fingerprint_hex
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -505,5 +548,47 @@ mod tests {
         let b = Identity::create(&dir.path().join("b.json"), "pw").unwrap();
 
         assert_ne!(a.signing_key.verifying_key(), b.signing_key.verifying_key());
+    }
+
+    #[test]
+    fn fingerprint_hex_is_deterministic_and_key_sensitive() {
+        let dir = tempdir().unwrap();
+        let a = Identity::create(&dir.path().join("a.json"), "pw").unwrap();
+        let b = Identity::create(&dir.path().join("b.json"), "pw").unwrap();
+        let a_key_hex = hex::encode(a.signing_key.verifying_key().as_bytes());
+        let b_key_hex = hex::encode(b.signing_key.verifying_key().as_bytes());
+
+        let fp_a1 = fingerprint_hex(&a_key_hex);
+        let fp_a2 = fingerprint_hex(&a_key_hex);
+        let fp_b = fingerprint_hex(&b_key_hex);
+
+        assert_eq!(fp_a1, fp_a2);
+        assert_ne!(fp_a1, fp_b);
+        assert_eq!(fp_a1.len(), FINGERPRINT_HEX_LEN);
+    }
+
+    #[test]
+    fn fingerprint_hex_is_not_a_slice_of_the_raw_key() {
+        // Domain separation (SLICE-03.md D5): the fingerprint must be a hash, not a
+        // prefix of the key itself, so it never coincides with the routing key or the
+        // raw key's own leading bytes.
+        let dir = tempdir().unwrap();
+        let identity = Identity::create(&dir.path().join("a.json"), "pw").unwrap();
+        let key_hex = hex::encode(identity.signing_key.verifying_key().as_bytes());
+
+        let fp = fingerprint_hex(&key_hex);
+        assert_ne!(fp, key_hex[..FINGERPRINT_HEX_LEN]);
+    }
+
+    #[test]
+    fn fingerprint_hex_handles_malformed_input_without_panicking() {
+        let fp = fingerprint_hex("not hex at all");
+        assert_eq!(fp.len(), FINGERPRINT_HEX_LEN);
+    }
+
+    #[test]
+    fn format_fingerprint_groups_in_fours() {
+        let formatted = format_fingerprint("a1b2c3d4e5f60718293a");
+        assert_eq!(formatted, "a1b2 c3d4 e5f6 0718 293a");
     }
 }
