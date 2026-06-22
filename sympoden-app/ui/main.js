@@ -121,17 +121,23 @@ async function refreshPeers() {
   }
 }
 
-async function doRelabel(query, newLabel, confirmCollision) {
+// `ed25519Pubkey` is the peer's exact key (straight from list_peers's own output, the
+// same value rendered into the relabel button's data attribute) - never a label or a
+// fingerprint to resolve. The GUI already knows exactly which peer it means; sending
+// anything other than the exact key here is what caused the original "no pinned peer
+// matches <64-hex-key>" bug (the backend used to run this through label/fingerprint
+// resolution meant for typed CLI input, which a raw key never matches).
+async function doRelabel(ed25519Pubkey, newLabel, confirmCollision) {
   try {
     const result = await invoke("relabel_peer", {
-      query,
+      ed25519Pubkey,
       newLabel,
       confirmCollision: !!confirmCollision,
     });
     if (result.NeedsCollisionConfirmation) {
       const existing = result.NeedsCollisionConfirmation.existing;
       if (confirm(`"${newLabel}" is already used by: ${describeCollision(existing)}. Rename anyway?`)) {
-        await doRelabel(query, newLabel, true);
+        await doRelabel(ed25519Pubkey, newLabel, true);
       }
       return;
     }

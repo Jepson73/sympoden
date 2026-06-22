@@ -24,7 +24,7 @@ use thiserror::Error;
 use sympoden_engine::content::Note;
 use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError};
 use sympoden_engine::identity::{Identity, PublicCard, fingerprint_hex, format_fingerprint};
-use sympoden_engine::store::{AddPeerOutcome, PinnedPeer, SendTargets, Store, resolve_peer_query};
+use sympoden_engine::store::{AddPeerOutcome, PinnedPeer, SendTargets, Store};
 use sympoden_engine::sync::{self, RelayClient};
 use sympoden_engine::trust::{self, TrustedNote};
 
@@ -201,22 +201,26 @@ fn add_peer_card(
     Ok(AddPeerResult::Outcome(outcome))
 }
 
-/// Rename a pinned peer's label, addressed by key/label/fingerprint query (same
-/// resolution as the CLI's `relabel-peer`). Same confirm-before-write collision flow
-/// as `add_peer_card`.
+/// Rename a pinned peer's label, addressed by the peer's exact key.
+///
+/// Deliberately takes `ed25519_pubkey`, not a `resolve_peer_query`-style typed query:
+/// the GUI already holds the peer's exact key (it came straight from `list_peers`,
+/// rendered into the relabel button's own data attribute) - it never needs, and must
+/// never go through, fuzzy label/fingerprint resolution. `resolve_peer_query` exists
+/// for *human-typed* input (the CLI's `--to`/`relabel-peer <query>` arguments), not for
+/// a value the caller already knows exactly. Routing an exact key through it was the
+/// bug: a raw 64-hex pubkey matches neither a label nor a 20-hex fingerprint, so it
+/// always resolved to `UnknownPeerKey` no matter which peer was clicked.
 fn relabel_peer_now(
     session: &Session,
-    query: &str,
+    ed25519_pubkey: &str,
     new_label: &str,
     confirm_collision: bool,
 ) -> Result<RelabelResult, AppError> {
-    let peers = session.store.list_peers()?;
-    let target = resolve_peer_query(query, &peers)?.clone();
-
     if !confirm_collision {
         let collisions = session
             .store
-            .check_label_collision(new_label, &target.ed25519_pubkey)?;
+            .check_label_collision(new_label, ed25519_pubkey)?;
         if !collisions.is_empty() {
             return Ok(RelabelResult::NeedsCollisionConfirmation {
                 existing: collisions.iter().map(PeerView::from).collect(),
@@ -224,7 +228,7 @@ fn relabel_peer_now(
         }
     }
 
-    session.store.relabel_peer(&target.ed25519_pubkey, new_label)?;
+    session.store.relabel_peer(ed25519_pubkey, new_label)?;
     Ok(RelabelResult::Relabeled)
 }
 
@@ -375,7 +379,7 @@ fn add_peer(
 #[tauri::command]
 fn relabel_peer(
     state: State<AppState>,
-    query: String,
+    ed25519_pubkey: String,
     new_label: String,
     confirm_collision: bool,
 ) -> Result<RelabelResult, String> {
@@ -384,7 +388,7 @@ fn relabel_peer(
         .lock()
         .map_err(|_| "internal error".to_string())?;
     let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
-    relabel_peer_now(session, &query, &new_label, confirm_collision).map_err(|e| e.to_string())
+    relabel_peer_now(session, &ed25519_pubkey, &new_label, confirm_collision).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -706,8 +710,17 @@ mod tests {
         assert_eq!(peers[0].label, "bob");
     }
 
+    // Regression test for a real GUI bug: the frontend's Rename button passes the
+    // peer's exact `ed25519_pubkey` (a raw 64-hex string, taken straight from
+    // `list_peers`'s own output) as the identifier - never a label, never a
+    // fingerprint. `relabel_peer_now` must accept that key directly; routing it
+    // through `resolve_peer_query` (label/fingerprint resolution meant for *typed*
+    // CLI input) was the bug, since a raw pubkey matches neither and always resolved
+    // to `UnknownPeerKey`, no matter which peer was clicked. This test passes exactly
+    // the shape the frontend sends - it would have caught the original bug, where a
+    // test that passed the label "bob" (as this one used to) could not.
     #[test]
-    fn relabel_peer_renames_without_changing_the_key() {
+    fn relabel_peer_renames_by_exact_key_without_changing_it() {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "passphrase").unwrap();
         let bob_dir = dir.path().join("bob");
@@ -716,14 +729,27 @@ mod tests {
         let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
         add_peer_card(&session, "bob", &bob_card, false).unwrap();
         let original_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
+        assert_eq!(original_key.len(), 64, "sanity check: a raw hex Ed25519 key, not a label or fingerprint");
 
-        let result = relabel_peer_now(&session, "bob", "robert", false).unwrap();
+        let result = relabel_peer_now(&session, &original_key, "robert", false).unwrap();
         assert!(matches!(result, RelabelResult::Relabeled));
 
         let peers = list_peers_inner(&session).unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].label, "robert");
         assert_eq!(peers[0].ed25519_pubkey, original_key);
+    }
+
+    #[test]
+    fn relabel_peer_rejects_an_unpinned_key_cleanly() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+
+        let result = relabel_peer_now(&session, "ab".repeat(32).as_str(), "anyone", false);
+        assert!(matches!(
+            result,
+            Err(AppError::Store(StoreError::UnknownPeerKey { .. }))
+        ));
     }
 
     #[test]
