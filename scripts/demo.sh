@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice 01 + Slice 02 end-to-end acceptance demo.
+# Slice 01 + Slice 02 + Slice 03 end-to-end acceptance demo.
 #
 # Slice 01: Alice creates an identity, posts a signed note, pushes it to a blind
 # relay, and goes fully offline. Later, Bob - a separate process, never running at
@@ -9,10 +9,15 @@
 # Slice 02 (TOFU): the same exchange, but now checking *who* Bob believes sent it.
 # Bob receives Alice's first note before pinning her (Unknown), pins her, and the
 # same note reclassifies as Known on the next listing (AC8's recompute-at-display).
-# A third identity (Carol) who Bob never pins stays Unknown forever - Bob's
-# single-peer cap means he can't pin her even if he tried, which this script also
-# checks, along with a rejected re-pin (same label, different key) and an idempotent
-# re-add (same label, same key). See docs/slices/SLICE-02.md.
+# See docs/slices/SLICE-02.md.
+#
+# Slice 03 (key-as-identity + multi-peer send): a peer is identified by key, not
+# label - Bob can pin a third, distinct peer (the one-peer cap is gone), and a second
+# peer can share an existing label (a collision, warned-about by default, refusable
+# with --strict, and resolvable via relabel-peer). A posted note can broadcast to every
+# pinned peer or target a directed subset, with per-recipient delivery state so one
+# occupied relay slot never blocks or duplicates delivery to anyone else.
+# See docs/slices/SLICE-03.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -97,7 +102,7 @@ echo "OK: note appears in Bob's local list, shown as unknown sender (SLICE-02 AC
 echo "==> Bob: pin Alice, then re-list - the same note should reclassify as known"
 printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$ALICE_CARD" >/dev/null
 LIST_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list)
-if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY" || ! echo "$LIST_OUTPUT" | grep -q "(alice):"; then
+if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY" || ! echo "$LIST_OUTPUT" | grep -q "(alice ("; then
     echo "FAIL: expected Alice's note to now show under her pinned label \"alice\""
     exit 1
 fi
@@ -128,7 +133,7 @@ fi
 echo "OK: both notes arrived - posting ahead of a sync never silently loses one"
 
 CAROL_DIR="$WORKDIR/carol"
-STRANGER_BODY="hello from a stranger bob never pinned - $(date +%s)"
+STRANGER_BODY="hello from a stranger bob never pins - $(date +%s)"
 
 echo "==> Carol (a stranger Bob never pins): post to Bob, who already has Alice pinned"
 printf 'carol-pass\ncarol-pass\n' | "$CLI" --data-dir "$CAROL_DIR" init >/dev/null
@@ -144,36 +149,195 @@ if ! echo "$SYNC_OUTPUT" | grep -qF "$STRANGER_BODY" || ! echo "$SYNC_OUTPUT" | 
 fi
 echo "OK: Carol's note arrived, shown as unknown sender - a stranger Bob never pinned"
 
-echo "==> Bob: a second distinct label is rejected (single-peer cap, SLICE-02 D2/AC6)"
-set +e
-CAP_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer carol "$CAROL_CARD" 2>&1)
-CAP_STATUS=$?
-set -e
-if [ "$CAP_STATUS" -eq 0 ] || ! echo "$CAP_OUTPUT" | grep -qi "already configured"; then
-    echo "FAIL: expected adding a second distinct peer to be rejected, got: $CAP_OUTPUT"
+DAVE_DIR="$WORKDIR/dave"
+echo "==> Bob: pinning a 2nd and 3rd distinct peer succeeds - the one-peer cap is gone (SLICE-03 AC1)"
+printf 'dave-pass\ndave-pass\n' | "$CLI" --data-dir "$DAVE_DIR" init >/dev/null
+DAVE_CARD=$(printf 'dave-pass\n' | "$CLI" --data-dir "$DAVE_DIR" whoami)
+printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer carol "$CAROL_CARD" >/dev/null
+printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer dave "$DAVE_CARD" >/dev/null
+PEER_COUNT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list-peers | wc -l)
+if [ "$PEER_COUNT" -ne 3 ]; then
+    echo "FAIL: expected Bob to have 3 pinned peers (alice, carol, dave), got $PEER_COUNT"
     exit 1
 fi
-echo "OK: a second distinct peer is rejected - Carol can never be pinned while Alice is, so her note stays unknown forever"
+echo "OK: a 2nd and 3rd distinct peer pin both succeeded - no cap"
 
-echo "==> Bob: re-pinning \"alice\" with a different key is rejected, the working pin survives (AC5)"
-set +e
-REPIN_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$CAROL_CARD" 2>&1)
-REPIN_STATUS=$?
-set -e
-if [ "$REPIN_STATUS" -eq 0 ] || ! echo "$REPIN_OUTPUT" | grep -qi "different key"; then
-    echo "FAIL: expected re-pinning \"alice\" to a different key to be rejected, got: $REPIN_OUTPUT"
+EVE_DIR="$WORKDIR/eve"
+echo "==> Bob: pinning a peer under a label he already uses is a collision - warned, not blocked by default (SLICE-03 AC3)"
+printf 'eve-pass\neve-pass\n' | "$CLI" --data-dir "$EVE_DIR" init >/dev/null
+EVE_CARD=$(printf 'eve-pass\n' | "$CLI" --data-dir "$EVE_DIR" whoami)
+COLLISION_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$EVE_CARD" 2>&1)
+if ! echo "$COLLISION_OUTPUT" | grep -qi "warning.*already used by a pinned peer"; then
+    echo "FAIL: expected a printed collision warning, got: $COLLISION_OUTPUT"
     exit 1
 fi
-LIST_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list)
-if ! echo "$LIST_OUTPUT" | grep -qF "$NOTE_BODY" || ! echo "$LIST_OUTPUT" | grep -q "(alice):"; then
-    echo "FAIL: Alice's pin did not survive the rejected re-pin attempt"
+ALICE_LINES=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list-peers | grep -c '^alice (')
+if [ "$ALICE_LINES" -ne 2 ]; then
+    echo "FAIL: expected two distinct \"alice\"-labeled peers after the collision, got $ALICE_LINES"
     exit 1
 fi
-echo "OK: rejected re-pin did not disturb the existing \"alice\" pin"
+echo "OK: a second \"alice\" was pinned under a different key, with a printed warning - not blocked"
 
-echo "==> Bob: re-adding \"alice\" with her actual (unchanged) card is a no-op success (AC4)"
+MALLORY_DIR="$WORKDIR/mallory"
+echo "==> Bob: a third \"alice\"-labeled peer is refused under --strict (SLICE-03 AC3, the seam's reject path)"
+printf 'mallory-pass\nmallory-pass\n' | "$CLI" --data-dir "$MALLORY_DIR" init >/dev/null
+MALLORY_CARD=$(printf 'mallory-pass\n' | "$CLI" --data-dir "$MALLORY_DIR" whoami)
+set +e
+STRICT_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$MALLORY_CARD" --strict 2>&1)
+STRICT_STATUS=$?
+set -e
+if [ "$STRICT_STATUS" -eq 0 ] || ! echo "$STRICT_OUTPUT" | grep -qi "already pinned to a different peer"; then
+    echo "FAIL: expected --strict to refuse a colliding add-peer, got: $STRICT_OUTPUT"
+    exit 1
+fi
+ALICE_LINES=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list-peers | grep -c '^alice (')
+if [ "$ALICE_LINES" -ne 2 ]; then
+    echo "FAIL: --strict's refusal must not have written anything - still expected exactly 2 \"alice\" peers, got $ALICE_LINES"
+    exit 1
+fi
+echo "OK: --strict refused the third collision and wrote nothing"
+
+echo "==> Bob: relabeling the impostor \"alice\" (Eve) to her own name, by fingerprint (SLICE-03 AC5)"
+EVE_FINGERPRINT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list-peers \
+    | grep '^alice (' | tail -n1 | sed -E 's/^alice \(([^)]*)\)$/\1/' | tr -d ' ')
+printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" relabel-peer "alice#$EVE_FINGERPRINT" eve >/dev/null
+LIST_PEERS_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list-peers)
+if [ "$(echo "$LIST_PEERS_OUTPUT" | grep -c '^alice (')" -ne 1 ] || ! echo "$LIST_PEERS_OUTPUT" | grep -q '^eve ('; then
+    echo "FAIL: expected exactly one \"alice\" and a new \"eve\" after relabeling, got: $LIST_PEERS_OUTPUT"
+    exit 1
+fi
+EVE_FINGERPRINT_AFTER=$(echo "$LIST_PEERS_OUTPUT" | grep '^eve (' | sed -E 's/^eve \(([^)]*)\)$/\1/' | tr -d ' ')
+if [ "$EVE_FINGERPRINT_AFTER" != "$EVE_FINGERPRINT" ]; then
+    echo "FAIL: relabeling must not change the peer's key/fingerprint"
+    exit 1
+fi
+echo "OK: relabeled without touching the underlying key - fingerprint unchanged"
+
+echo "==> Bob: re-adding Eve's card under yet another label is a loud no-op, not a silent rename (SLICE-03 AC2/Adjustment 3)"
+NOOP_OUTPUT=$(printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer evelyn "$EVE_CARD" 2>&1)
+if ! echo "$NOOP_OUTPUT" | grep -qi 'already pinned as "eve" - use relabel-peer to rename'; then
+    echo "FAIL: expected the loud no-op message, got: $NOOP_OUTPUT"
+    exit 1
+fi
+if printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" list-peers | grep -q '^evelyn ('; then
+    echo "FAIL: add-peer must never silently create/rename a label - \"evelyn\" must not exist"
+    exit 1
+fi
+echo "OK: same-key re-add under a new label changed nothing, loudly"
+
+echo "==> Bob: re-adding \"alice\" with her actual (unchanged) card is a silent no-op success (SLICE-02 AC4)"
 printf 'bob-pass\n' | "$CLI" --data-dir "$BOB_DIR" add-peer alice "$ALICE_CARD"
 echo "OK: idempotent re-add succeeded"
+
+echo "==> Frank/Grace/Henry/Ivan: broadcast, directed, and partial-delivery retry (SLICE-03 AC3/4/6/7)"
+FRANK_DIR="$WORKDIR/frank"
+GRACE_DIR="$WORKDIR/grace"
+HENRY_DIR="$WORKDIR/henry"
+IVAN_DIR="$WORKDIR/ivan"
+
+printf 'frank-pass\nfrank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" init >/dev/null
+printf 'grace-pass\ngrace-pass\n' | "$CLI" --data-dir "$GRACE_DIR" init >/dev/null
+printf 'henry-pass\nhenry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" init >/dev/null
+printf 'ivan-pass\nivan-pass\n' | "$CLI" --data-dir "$IVAN_DIR" init >/dev/null
+
+FRANK_CARD=$(printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" whoami)
+GRACE_CARD=$(printf 'grace-pass\n' | "$CLI" --data-dir "$GRACE_DIR" whoami)
+HENRY_CARD=$(printf 'henry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" whoami)
+
+# Grace and Henry both pin Frank back, so Frank's notes classify as Known on arrival
+# (mirrors SLICE-02's "Bob also pins Alice" - the multi-recipient case must prove
+# labeled delivery works, not just that bytes arrive).
+printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" add-peer grace "$GRACE_CARD" >/dev/null
+printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" add-peer henry "$HENRY_CARD" >/dev/null
+printf 'grace-pass\n' | "$CLI" --data-dir "$GRACE_DIR" add-peer frank "$FRANK_CARD" >/dev/null
+printf 'henry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" add-peer frank "$FRANK_CARD" >/dev/null
+
+echo "==> Ivan (a throwaway): occupies Henry's relay slot before Frank ever pushes to him"
+printf 'ivan-pass\n' | "$CLI" --data-dir "$IVAN_DIR" add-peer henry "$HENRY_CARD" >/dev/null
+OCCUPYING_BODY="ivan's occupying note - $(date +%s)"
+printf 'ivan-pass\n' | "$CLI" --data-dir "$IVAN_DIR" post "$OCCUPYING_BODY" >/dev/null
+printf 'ivan-pass\n' | "$CLI" --data-dir "$IVAN_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+
+BROADCAST_BODY="frank's broadcast note - $(date +%s)"
+printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" post "$BROADCAST_BODY" >/dev/null
+PUSH_OUTPUT=$(printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$PUSH_OUTPUT" | grep -qi "handed note .* to the relay for grace"; then
+    echo "FAIL: expected the broadcast to succeed for grace, got: $PUSH_OUTPUT"
+    exit 1
+fi
+if ! echo "$PUSH_OUTPUT" | grep -qi "henry .* stays pending"; then
+    echo "FAIL: expected henry's push to bounce as occupied (his slot holds ivan's note), got: $PUSH_OUTPUT"
+    exit 1
+fi
+echo "OK: broadcast reached grace immediately; henry's occupied slot left him pending, not blocking grace (AC6/AC7)"
+
+GRACE_LIST=$(printf 'grace-pass\n' | "$CLI" --data-dir "$GRACE_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$GRACE_LIST" | grep -qF "$BROADCAST_BODY" || ! echo "$GRACE_LIST" | grep -qi "frank ("; then
+    echo "FAIL: expected grace to receive frank's broadcast note, classified as known"
+    exit 1
+fi
+echo "OK: grace received the broadcast note, classified Known (AC3/AC5/AC8)"
+
+HENRY_SYNC1=$(printf 'henry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$HENRY_SYNC1" | grep -qF "$OCCUPYING_BODY" || ! echo "$HENRY_SYNC1" | grep -qi "unknown sender"; then
+    echo "FAIL: expected henry to first drain ivan's occupying note (unknown sender), got: $HENRY_SYNC1"
+    exit 1
+fi
+if echo "$HENRY_SYNC1" | grep -qF "$BROADCAST_BODY"; then
+    echo "FAIL: frank's broadcast note must not have reached henry yet - his slot was still occupied at push time"
+    exit 1
+fi
+echo "OK: henry's first sync only drained the occupier, freeing his slot - frank's note has not arrived yet"
+
+RETRY_OUTPUT=$(printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$RETRY_OUTPUT" | grep -qi "handed note .* to the relay for henry"; then
+    echo "FAIL: expected the retried push to henry to succeed now that his slot is free, got: $RETRY_OUTPUT"
+    exit 1
+fi
+HENRY_SYNC2=$(printf 'henry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$HENRY_SYNC2" | grep -qF "$BROADCAST_BODY"; then
+    echo "FAIL: expected henry to receive frank's broadcast note on the retried sync"
+    exit 1
+fi
+HENRY_NOTES=$(printf 'henry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" list)
+HENRY_BODY_COUNT=$(echo "$HENRY_NOTES" | grep -cF "$BROADCAST_BODY")
+if [ "$HENRY_BODY_COUNT" -ne 1 ]; then
+    echo "FAIL: expected exactly one copy of frank's broadcast note in henry's list, got $HENRY_BODY_COUNT"
+    exit 1
+fi
+echo "OK: the retried push delivered to henry exactly once - no duplicate (AC6/AC7)"
+
+echo "==> Frank: a directed post (--to grace) reaches only grace, never henry (SLICE-03 AC4)"
+DIRECTED_BODY="frank's directed note for grace only - $(date +%s)"
+printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" post "$DIRECTED_BODY" --to grace >/dev/null
+printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+printf 'grace-pass\n' | "$CLI" --data-dir "$GRACE_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+printf 'henry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+
+if ! printf 'grace-pass\n' | "$CLI" --data-dir "$GRACE_DIR" list | grep -qF "$DIRECTED_BODY"; then
+    echo "FAIL: expected grace (the directed recipient) to receive the directed note"
+    exit 1
+fi
+if printf 'henry-pass\n' | "$CLI" --data-dir "$HENRY_DIR" list | grep -qF "$DIRECTED_BODY"; then
+    echo "FAIL: henry was not in the --to list and must never receive the directed note"
+    exit 1
+fi
+echo "OK: directed post reached only the selected recipient - checked positively and negatively"
+
+echo "==> Frank: an unresolvable --to value fails clean, addressing nothing"
+set +e
+BAD_TO_OUTPUT=$(printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" post "should never be sent" --to nobody 2>&1)
+BAD_TO_STATUS=$?
+set -e
+if [ "$BAD_TO_STATUS" -eq 0 ] || ! echo "$BAD_TO_OUTPUT" | grep -qi "no pinned peer matches"; then
+    echo "FAIL: expected an unresolvable --to to fail with UnknownPeerKey, got: $BAD_TO_OUTPUT"
+    exit 1
+fi
+if printf 'frank-pass\n' | "$CLI" --data-dir "$FRANK_DIR" list | grep -qF "should never be sent"; then
+    echo "FAIL: a post whose recipient failed to resolve must never be stored - it was supposed to fail before insert_note ran"
+    exit 1
+fi
+echo "OK: an unresolvable recipient query fails cleanly (UnknownPeerKey) before the note is ever created"
 
 echo "==> Checking a wrong passphrase fails cleanly (no panic)"
 set +e
@@ -191,4 +355,4 @@ fi
 echo "OK: wrong passphrase fails with a typed error (exit code $WRONG_STATUS), no panic"
 
 echo
-echo "All Slice 01 and Slice 02 acceptance criteria demonstrated successfully."
+echo "All Slice 01, Slice 02, and Slice 03 acceptance criteria demonstrated successfully."
