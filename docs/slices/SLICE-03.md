@@ -553,9 +553,24 @@ confirm dialog) ships here; an actual settings surface is explicitly a non-goal.
 
 ## Status
 
-**Planned — not yet implemented.** This document is the output of a second planning
-pass (the first draft, built on the label-as-PK model, is superseded by this revision).
-No engine/CLI/app code has been written against it yet.
+**Code-complete and headless-verified.** `cargo test --workspace` (94 tests: 15 app, 71
+engine, 8 relay, 0 cli-unit) and `cargo clippy --workspace --all-targets -- -D warnings`
+are clean; `cargo build -p sympoden-app` succeeds; the extended `scripts/demo.sh`
+demonstrates AC1-AC8 end to end against a live relay — multi-peer-by-key, label
+collision (warned and `--strict`-refused), relabel, the same-key-different-label loud
+no-op, broadcast, directed (positive and negative), and the partial-delivery retry with
+no duplicate. `git diff 50a85a9..HEAD` (the commit at the start of this slice) confirms
+`crypto.rs`, `content.rs`, `trust.rs`, `sync.rs`, and the entire `relay` crate are
+byte-for-byte unchanged.
+
+**Not yet GUI-verified.** Unlike Slice 01/02's closeout, this slice's app-side UI (the
+peer list, recipient checkboxes, relabel inputs, and the collision confirm dialog) has
+not been clicked through in a running Tauri window in this environment — only its
+underlying Tauri-command logic, which is exercised headlessly in
+`sympoden-app/src/main.rs`'s own test module. The frontend JS was reviewed by hand (no
+`node` available in this environment to lint it) but not run. A GUI walkthrough is
+still owed before this slice is considered fully closed out, the same discipline
+Slice 01/02 applied.
 
 ## Invariant check for this slice
 
