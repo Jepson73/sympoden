@@ -1,4 +1,4 @@
-# Foundation — Invariants & Safety Ladder (v0.16, draft to be torn apart)
+# Foundation — Invariants & Safety Ladder (v0.17, draft to be torn apart)
 
 > This is the *stable core* the rest of the plan hangs off. Everything here should
 > survive every rewrite. If a later design decision contradicts an invariant, the
@@ -234,6 +234,82 @@ posts (public needs no consent).
 N keys and **re-keying when a member is removed** (an ex, a fallout), plus deciding
 whether members may see *who else* is in the circle (recipient-set metadata). Same hard
 problem as secure group messaging; design it now, not later.
+
+**Receive-side consent on the direct (point-to-point) path — block / mute / delete.**
+Circles above solve consent for *audience* (who a post is encrypted to); this is the
+companion piece for consent on *receipt* — what happens to mail from a key you've
+pinned, once it's landing in your own mailbox. Recorded here, ahead of code, as the
+near-term basis for **Slice 04** (the direct level only — the room level below is
+later, but its governing principle is stated now so that slice inherits it instead of
+improvising one).
+
+- *Delete a peer (forget the name).* The peer is removed from your local table.
+  Trust classification is never stamped onto a message at receive time — it is always
+  recomputed from the *current* table at display time. So deleting unwinds in one
+  stroke: every message from that key, old and new, reclassifies to `unknown`,
+  because there is no before/after-delete distinction anywhere in storage. The
+  history itself is never erased — nothing is deleted from the device, only
+  reclassified. Re-adding the same card later matches by key, not by when it arrived,
+  so the newly chosen label repaints *every* message from that key at once, past and
+  future. **This recompute-always property is to be preserved, not redesigned.**
+- *Block (refuse the content).* While active, anything arriving from that key on the
+  direct path is discarded at receipt — pulled from your own routing-key mailbox,
+  identified as a blocked author, dropped unstored. Nothing is kept, so nothing can
+  resurface later. This is invariant #5's "enforced by people" in its most literal
+  form: a block is a person refusing, not the system inspecting content to decide.
+- *Mute.* Received and kept, exactly as an unblocked peer's mail would be, but
+  display-suppressed. The distinction from block is the whole point: muted content
+  still exists on your device; blocked content never arrives at all.
+- **Default coupling, separable underneath.** Deleting a peer, by default, also
+  blocks them — "I removed them, they shouldn't keep reaching me" is the behavior
+  users expect from one action. But the two stay separable in the engine: *block
+  without delete* (keep recognizing them, keep their history, just stop new mail
+  landing) and *delete without block* (tidy the name off your list, indifferent to
+  whether they write again) are both legitimate single-sided cases that must remain
+  expressible. Couple the two at the UI's default action; never weld them together
+  underneath.
+
+**The level-split principle — one key, different consent per layer, by architecture,
+not by rule.** A direct message is sealed to you specifically and pushed to your own
+routing-key mailbox; you alone pull that slot — block/mute/delete act only here. A
+room message, once rooms exist, arrives because you chose to pull a room's shared log
+off a board — a different address, a different act, with no mailbox involved at all.
+A key you have blocked or deleted on the direct path therefore stays fully visible in
+a room you both happen to read, rendered `unknown` (or under its self-signed nickname,
+if it carries one) — because the room-pull path never consults your direct-path
+labels or block-list at all. This is not a gap to be closed later: the DM block lives
+entirely on the mailbox path and never touches the room-pull path, so it cannot reach
+into rooms even in principle. State the principle now so the rooms slice
+inherits a stated split rather than discovering — or worse, "fixing" — it under
+deadline. Room-level mute is deferred to that slice; even there it can only ever be a
+*display* mute in your own view: you cannot drop-at-receipt a shared log you pulled
+wholesale, and you cannot remove a participant from a room for anyone but yourself —
+that is moderation of a shared space, which is per-board policy, never a single
+reader's call.
+
+**Honesty edges (invariant #6 — say this plainly, do not gloss it):**
+- *Block is local and cooperative on the sender's side only.* Deleting or blocking a
+  peer never reaches their device — they keep your card and keep sealing-and-pushing
+  exactly as before, unaware anything changed. The blind relay structurally cannot
+  filter by sender (it does not know who sent what); the same blindness that protects
+  everyone now cuts the other way. Block stops *your client from keeping* what
+  arrives — it does not stop them sending, and it does not stop the relay from
+  holding their blob in your mailbox slot. A user who reads "block" as "they can no
+  longer reach me" has a false model of what just happened; the UI must say so, not
+  let the word imply more than the mechanism delivers.
+- *The straggler.* "Nothing from the blocked/deleted period exists" is true only
+  because block discards at receipt *while active*. The one gap: a message that
+  reached the relay during the block, but is pulled for the first time only *after*
+  you unblock or re-add, is treated as an ordinary current message — nothing marks it
+  as belonging to the past window, and a sender-claimed timestamp is not trustworthy
+  enough to gate on. This is narrow — it only fires if the re-add lands between their
+  send and your next sync — and it is named here, not solved here.
+
+**Open scoping question (recorded, not resolved here).** The mutual-connection
+handshake that circles already use is the eventual completion of this consent
+surface — real two-way awareness, beyond one-sided block/mute/delete. Whether that
+handshake belongs inside Slice 04 or is its own later slice is an open fork; decide it
+at slice-planning time.
 
 **Two kinds of retention, cleanly split:**
 - *Automatic* — the leased friend-copy and the relay buffer — runs on the **owner's**
