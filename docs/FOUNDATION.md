@@ -1,4 +1,4 @@
-# Foundation — Invariants & Safety Ladder (v0.17, draft to be torn apart)
+# Foundation — Invariants & Safety Ladder (v0.18, draft to be torn apart)
 
 > This is the *stable core* the rest of the plan hangs off. Everything here should
 > survive every rewrite. If a later design decision contradicts an invariant, the
@@ -119,6 +119,54 @@ not granted by default.**
   decision to persist, and the consent to permanence. One action, three jobs.
 - This dissolves the old departure problem for the ephemeral layer (vanishing is
   free) and confines it to the durable layer, where the user explicitly chose it.
+
+### No unsend — the enforceable boundary of "delete what I sent"
+
+This is a hard line, not an open question.
+
+**No unsend, no recall, no "please delete." What's sent is sent.** There is
+deliberately no mechanism to retract, recall, or request deletion of a note once
+sent. The moment a note leaves toward a recipient it is beyond the sender's control —
+the system is a **witness to what was sent, never a custodian of it**: once a note
+reaches someone, it is theirs to keep, the way a mailed letter or a spoken word is. A
+"please delete" action would be recall theater — it looks like retraction but is only
+a request the recipient can ignore, which would teach users they can unsay what they
+cannot. Refusing to build it is the honest design (§6): no false model of recall.
+
+**The line is drawn at push, not at pickup.** "Sent" means *pushed to the relay*, not
+*pulled by the recipient*. Even while a note still sits un-pulled in a recipient's
+relay slot, it is already gone from the sender's control — there is no "unsend before
+delivery." Drawing the line here is deliberate: a pre-pickup unsend would require the
+sender to observe delivery state, which is read-receipt / delivery-tracking
+territory — a surveillance-flavored capability that cuts against the blind relay. We
+build no read-receipts and no delivery tracking as a *feature* — the sender is never
+told a recipient has read a note. **Honest exception, named rather than denied
+(invariant #6):** because the relay holds exactly one blob per recipient, a sender
+who pushes into a still-occupied slot learns the recipient hasn't yet pulled whatever
+is waiting there — in the ordinary one-sender case, that's the sender's own prior
+note. A coarse pickup signal, not a read receipt; a side effect of the relay's
+capacity, not a tracking feature — but real, and named here, not papered over.
+
+**Correction is by new linked statement, not erasure (§5).** The way to address a
+mistake — an oopsie, or one's own earlier error — is to say the next thing: a
+correction is a new statement, linked to what it corrects, the same "history is the
+artifact" discipline §5 already applies to Facts. The original stays; the correction
+rides on top. This preserves that a thing was said and then amended — which is what
+honesty looks like — rather than letting the record be silently rewritten.
+
+**Named, deferred — the shape of the disinformation problem.** Two choices already
+made here constrain how false content can ever be handled: **no one can force either
+copy to be deleted** (neither sender nor recipient can compel the other to remove
+theirs — though a recipient may always choose to discard their own, e.g. by blocking,
+§6) and **there is no central content authority** (§5 — no inspection, no arbiter).
+Therefore moderation of false or harmful content can *never* be removal-by-authority
+in this system — structurally, by design, not by oversight. When the disinformation
+problem is taken up later, its only available tools are: receiver-side (block / mute,
+§6's consent surface), epistemic
+(corrections, the fact/opinion distinction, possibly web-of-trust filtering at
+display), and per-board policy in the rooms layer. Recorded here as the *shape* of a
+deferred problem, so a future slice does not reach for a delete-the-lie primitive that
+this boundary has already ruled out — not as a problem solved in this note.
 
 ---
 
