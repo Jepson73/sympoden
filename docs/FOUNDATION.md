@@ -491,3 +491,9 @@ the first act of building — the point where planning stops helping and code ta
 - **Mode reconciliation:** retire/merge the redundant ADR axes into the ladder above.
 - **Lineage vs unlinkability:** how coherent a durable body of work stays vs how
   cleanly a person can vanish. These fight; pick the balance deliberately.
+  **Open-layer hosting** boards vs source (refines the frontier): because open content 
+  is public and signed, a federated-board model (many refusable aggregators you post to and 
+  read from, à la Nostr relays / Mastodon instances) is on-thesis and scales reading far 
+  better than pure source-hosting + DHT, at the cost of partial chokepoints. Keep boards 
+  many and refusable. Decide source-hosting vs federated-boards consciously when the open 
+  layer is built.
