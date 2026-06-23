@@ -7,13 +7,13 @@
 
 ## Status
 
-**Slices 01 and 02 shipped.** Identity + local note + async sync through one blind
-relay (Slice 01), and trust-on-first-use author↔peer binding on top of it (Slice 02),
-are both code-complete, headless-verified, and GUI-verified — see
-`docs/slices/SLICE-01.md` and `docs/slices/SLICE-02.md`. Next up is Phase 1 work per
-`docs/ROADMAP.md`. Everything in these docs remains a *draft to be tested against
-reality* — the two genuinely unsolved problems can only be answered by building
-further (see below).
+**Slices 01–03 shipped.** Identity + local note + async sync through one blind
+relay (Slice 01), trust-on-first-use author↔peer binding on top of it (Slice 02),
+and a key-as-identity peer model with multi-peer send (Slice 03) are all
+code-complete, headless-verified, and GUI-verified — see `docs/slices/SLICE-01.md`,
+`SLICE-02.md`, and `SLICE-03.md`. Next up is Phase 1 work per `docs/ROADMAP.md`.
+Everything in these docs remains a *draft to be tested against reality* — the two
+genuinely unsolved problems can only be answered by building further (see below).
 
 ## The non-negotiables (invariants)
 
@@ -40,6 +40,7 @@ decision contradicts one, the decision is wrong — not the invariant. Full text
 | `docs/ROADMAP.md` | Phased build order | To understand *what next* |
 | `docs/slices/SLICE-01.md` | The first prototype spec (shipped) | To see what's built |
 | `docs/slices/SLICE-02.md` | The TOFU trust-layer spec (shipped) | To see what's built |
+| `docs/slices/SLICE-03.md` | The key-as-identity + multi-peer send spec (shipped) | To see what's built |
 | `docs/RECONCILIATION.md` | Maps the original 24 ADRs to this foundation | When touching an ADR |
 | `docs/GLOSSARY.md` | Shared vocabulary | When a term is unclear |
 
@@ -70,5 +71,11 @@ store-and-forward) and the identity friction.
 
 `docs/slices/SLICE-02.md` then made a received note's author meaningful: bound to a
 peer you pinned (trust-on-first-use), or flagged distinctly as unrecognized — peers
-now live only in the encrypted local store, never a plaintext file. See
-`docs/ROADMAP.md` for what's next.
+now live only in the encrypted local store, never a plaintext file.
+
+`docs/slices/SLICE-03.md` reworked peers around the key as identity: a peer *is* its
+Ed25519 key, and the label is just a non-unique local alias — so the same name can sit
+on two different keys, told apart by a short fingerprint, without collision. It lifts
+the single-peer cap: a note can be broadcast to every pinned peer or directed to a
+chosen subset, sealed per recipient and pushed to each, with per-recipient delivery
+state so a partial send retries only the unsent. See `docs/ROADMAP.md` for what's next.
