@@ -61,6 +61,35 @@ Slice 01's request-size cap (resolves Slice 01's accepted lazy-expiry gap); clos
 Slice 01/02's accepted sender-authorization gap at the protocol level (today, an unknown
 sender's note is labeled, not blocked — see `docs/ARCHITECTURE.md` §9).
 
+**Tracked cleanup:** `notes.synced_at` (`StoredNote.synced_at`) has been dead since
+Slice 03 — `note_sends` is sole source of truth for delivery state, and the column is
+only ever written, never read back into a decision. Remove the column, the struct field,
+and `content.rs::to_stored()`'s `synced_at: None` the next time a slice is already
+touching `content.rs` for another reason; don't let it become permanent by default.
+
+**Slice 04 candidate — receive-side consent surface:**
+- *Block / mute*: a local deny-list of keys. Block drops/hides inbound from a key; mute
+  receives but doesn't surface it. Applies equally to unknown senders (by key/fingerprint)
+  and pinned peers. Fully local — the real anti-harassment lever, and the actual answer to
+  Slice 01/02/03's accepted "no receive-side consent gate" limitation.
+- *Delete / unpin peer*: remove a peer; their past notes reclassify to unknown via the
+  existing recompute-at-display path (the pin-flip in reverse) but they can still reach
+  you — delete forgets the name, block refuses the content; the two are orthogonal and
+  both are needed. Settle at slice time what happens to pending `note_sends` rows and
+  already-received notes addressed to/from the deleted peer (received notes stay and
+  reclassify; pending sends need an explicit decision, not an accident).
+
+**Forbid self-add:** reject `add_peer` when the card's key is the caller's own
+(`"that's your own card"`). Slice 03's Own-beats-peer classification already makes
+self-add harmless either way, so this is zero-risk tidiness, not a fix for a live bug.
+
+**UX — render-on-pin:** refresh the rendered notes list on any peer-table change
+(pin/unpin/relabel) without requiring a manual Sync Now — the unknown→known flip is a
+local recompute against already-stored notes, no network round trip needed.
+
+**UX — auto-sync-on-post:** posting should also push automatically; the current
+manual-only Sync Now is correct for dev/testing but is a later convenience to add.
+
 A related, still-open distinction to design deliberately here rather than improvise: peer
 **exchange** UX when a channel already exists between two people (e.g. a QR code, a
 `sympoden://` link, or a short pairing code, to make pinning a peer's card easier than

@@ -370,10 +370,10 @@ deleted as dead code now that `pending_sends()` replaces their purpose.
   per *peer*, not per label) so it is unambiguous by construction — the recipient
   checkbox list is keyed by `ed25519_pubkey`, never by label, so there is no equivalent
   of the CLI's ambiguous-label problem in the app at all. A received note's trust line
-  shows the fingerprint (computed client-side from `note.author_pubkey`, the same trivial
-  `slice(0, 8)` transform as `identity::fingerprint_hex` — duplicated as a one-line
-  presentational detail, the same way `describeTrust`'s label text already duplicates
-  the CLI's `trust_label` independently; not worth a round trip to avoid).
+  shows the fingerprint exactly as the engine computed it: `NoteView.fingerprint` /
+  `PeerView.fingerprint` are derived in Rust via `format_fingerprint(fingerprint_hex(...))`
+  (`FINGERPRINT_HEX_LEN` = 20) and sent over IPC; the frontend renders that string as
+  received — it never recomputes the hash or re-derives a length itself.
 
 **Tests / demo:**
 - `scripts/demo.sh` extended with:
@@ -553,7 +553,7 @@ confirm dialog) ships here; an actual settings surface is explicitly a non-goal.
 
 ## Status
 
-**Code-complete and headless-verified.** `cargo test --workspace` (94 tests: 15 app, 71
+**Code-complete and headless-verified.** `cargo test --workspace` (95 tests: 16 app, 71
 engine, 8 relay, 0 cli-unit) and `cargo clippy --workspace --all-targets -- -D warnings`
 are clean; `cargo build -p sympoden-app` succeeds; the extended `scripts/demo.sh`
 demonstrates AC1-AC8 end to end against a live relay — multi-peer-by-key, label
@@ -563,14 +563,13 @@ no duplicate. `git diff 50a85a9..HEAD` (the commit at the start of this slice) c
 `crypto.rs`, `content.rs`, `trust.rs`, `sync.rs`, and the entire `relay` crate are
 byte-for-byte unchanged.
 
-**Not yet GUI-verified.** Unlike Slice 01/02's closeout, this slice's app-side UI (the
-peer list, recipient checkboxes, relabel inputs, and the collision confirm dialog) has
-not been clicked through in a running Tauri window in this environment — only its
-underlying Tauri-command logic, which is exercised headlessly in
-`sympoden-app/src/main.rs`'s own test module. The frontend JS was reviewed by hand (no
-`node` available in this environment to lint it) but not run. A GUI walkthrough is
-still owed before this slice is considered fully closed out, the same discipline
-Slice 01/02 applied.
+**GUI-verified (2026-06-23).** A manual walkthrough on the laptop, in a running Tauri
+window, confirmed relabel-by-key (the label changes, the key stays put, no "no pinned
+peer matches" error), the collision-confirm dialog, the loud same-key-different-label
+no-op, and the core renders: Own/Known/Unknown classification, the 20-hex grouped
+fingerprint, broadcast vs. directed delivery, and a sender flipping from unknown to
+known immediately on pin. This closes the gap Slice 01/02's closeout held to the same
+standard — only headless/command-level coverage until now.
 
 ## Invariant check for this slice
 
