@@ -15,6 +15,7 @@ const peerLabelInput = document.getElementById("peer-label");
 const peerCardInput = document.getElementById("peer-card");
 const addPeerBtn = document.getElementById("add-peer-btn");
 const peerListEl = document.getElementById("peer-list");
+const blockedListEl = document.getElementById("blocked-list");
 const recipientListEl = document.getElementById("recipient-list");
 const noteBodyInput = document.getElementById("note-body");
 const postBtn = document.getElementById("post-btn");
@@ -61,8 +62,17 @@ async function refreshNotes() {
     const { text: trustText, cssClass } = describeTrust(item.trust);
     const li = document.createElement("li");
     const when = new Date(item.note.created_at * 1000).toLocaleString();
-    li.innerHTML = `<div>${escapeHtml(item.note.body)}</div><div class="meta">${when} — <span class="${cssClass}">${escapeHtml(trustText)}</span> ${fingerprintSpan(item.fingerprint)}</div>`;
+    // "Block sender" passes the note's own author_pubkey directly - the exact key
+    // already present in this note, never through label/fingerprint resolution. This
+    // is the only route to block a stranger from the notes list itself (they have no
+    // peer row to act on).
+    li.innerHTML = `<div>${escapeHtml(item.note.body)}</div><div class="meta">${when} — <span class="${cssClass}">${escapeHtml(trustText)}</span> ${fingerprintSpan(item.fingerprint)} <button data-block-sender="${escapeHtml(item.note.author_pubkey)}">Block sender</button></div>`;
     notesList.appendChild(li);
+  }
+  for (const button of notesList.querySelectorAll("[data-block-sender]")) {
+    button.addEventListener("click", async () => {
+      await doBlockKey(button.getAttribute("data-block-sender"));
+    });
   }
 }
 
@@ -89,6 +99,12 @@ function describeCollision(existing) {
   return existing.map((p) => `${p.label} (${p.fingerprint})`).join(", ");
 }
 
+// The peer row exposes delete and block as two independently invokable controls,
+// not one coupled action (SLICE-04.md §6/D-A's separable-underneath property): the
+// "Remove" button is the default coupled action (delete + block), the "keep
+// unblocked" checkbox next to it is the delete-without-block half, and the
+// standalone "Block" button is the block-without-delete half - usable on a peer you
+// want to keep pinned but stop hearing from.
 async function refreshPeers() {
   const peers = await invoke("list_peers");
 
@@ -96,17 +112,23 @@ async function refreshPeers() {
   recipientListEl.innerHTML = "";
 
   for (const peer of peers) {
+    const key = peer.ed25519_pubkey;
     const li = document.createElement("li");
     li.innerHTML = `${escapeHtml(peer.label)} ${fingerprintSpan(peer.fingerprint)}
       <span class="relabel-form">
-        <input type="text" placeholder="new label" data-relabel-for="${escapeHtml(peer.ed25519_pubkey)}" />
-        <button data-relabel-btn-for="${escapeHtml(peer.ed25519_pubkey)}">Rename</button>
+        <input type="text" placeholder="new label" data-relabel-for="${escapeHtml(key)}" />
+        <button data-relabel-btn-for="${escapeHtml(key)}">Rename</button>
+      </span>
+      <span class="peer-actions">
+        <button data-remove-btn-for="${escapeHtml(key)}">Remove</button>
+        <label><input type="checkbox" data-keep-unblocked-for="${escapeHtml(key)}" /> keep unblocked</label>
+        <button data-block-btn-for="${escapeHtml(key)}">Block</button>
       </span>`;
     peerListEl.appendChild(li);
 
     const recipientLi = document.createElement("li");
-    const checkboxId = `recipient-${peer.ed25519_pubkey}`;
-    recipientLi.innerHTML = `<label><input type="checkbox" id="${checkboxId}" data-recipient-key="${escapeHtml(peer.ed25519_pubkey)}" checked /> ${escapeHtml(peer.label)} ${fingerprintSpan(peer.fingerprint)}</label>`;
+    const checkboxId = `recipient-${key}`;
+    recipientLi.innerHTML = `<label><input type="checkbox" id="${checkboxId}" data-recipient-key="${escapeHtml(key)}" checked /> ${escapeHtml(peer.label)} ${fingerprintSpan(peer.fingerprint)}</label>`;
     recipientListEl.appendChild(recipientLi);
   }
 
@@ -118,6 +140,71 @@ async function refreshPeers() {
       if (!newLabel) return;
       await doRelabel(key, newLabel);
     });
+  }
+
+  for (const button of peerListEl.querySelectorAll("[data-remove-btn-for]")) {
+    button.addEventListener("click", async () => {
+      const key = button.getAttribute("data-remove-btn-for");
+      const checkbox = peerListEl.querySelector(`[data-keep-unblocked-for="${key}"]`);
+      await doRemovePeer(key, checkbox.checked);
+    });
+  }
+
+  for (const button of peerListEl.querySelectorAll("[data-block-btn-for]")) {
+    button.addEventListener("click", async () => {
+      await doBlockKey(button.getAttribute("data-block-btn-for"));
+    });
+  }
+
+  // Render-on-pin/unpin (SLICE-04.md's stated property): list_notes always
+  // recomputes trust fresh against the current peers table, so the fix is just
+  // calling it after every peer-table mutation, not a backend change.
+  await refreshNotes();
+}
+
+async function refreshBlocked() {
+  const blocked = await invoke("list_blocked");
+  blockedListEl.innerHTML = "";
+  for (const entry of blocked) {
+    const li = document.createElement("li");
+    li.innerHTML = `${fingerprintSpan(entry.fingerprint)} <button data-unblock-btn-for="${escapeHtml(entry.ed25519_pubkey)}">Unblock</button>`;
+    blockedListEl.appendChild(li);
+  }
+  for (const button of blockedListEl.querySelectorAll("[data-unblock-btn-for]")) {
+    button.addEventListener("click", async () => {
+      await doUnblockKey(button.getAttribute("data-unblock-btn-for"));
+    });
+  }
+}
+
+async function doRemovePeer(ed25519Pubkey, keepUnblocked) {
+  try {
+    await invoke("remove_peer", { ed25519Pubkey, keepUnblocked });
+    showStatus(keepUnblocked ? "Removed (left unblocked)." : "Removed and blocked.", false);
+    await refreshPeers();
+    await refreshBlocked();
+  } catch (err) {
+    showStatus(String(err), true);
+  }
+}
+
+async function doBlockKey(ed25519Pubkey) {
+  try {
+    await invoke("block_key", { ed25519Pubkey });
+    showStatus("Blocked.", false);
+    await refreshBlocked();
+  } catch (err) {
+    showStatus(String(err), true);
+  }
+}
+
+async function doUnblockKey(ed25519Pubkey) {
+  try {
+    await invoke("unblock_key", { ed25519Pubkey });
+    showStatus("Unblocked.", false);
+    await refreshBlocked();
+  } catch (err) {
+    showStatus(String(err), true);
   }
 }
 
@@ -153,8 +240,8 @@ async function enterApp() {
   appSection.classList.remove("hidden");
   const card = await invoke("whoami");
   myCardEl.value = btoa(card);
-  await refreshPeers();
-  await refreshNotes();
+  await refreshPeers(); // also refreshes notes, at its end
+  await refreshBlocked();
 }
 
 async function init() {
@@ -186,6 +273,10 @@ createBtn.addEventListener("click", async () => {
 
 async function doAddPeer(label, card, confirmCollision) {
   const result = await invoke("add_peer", { label, card, confirmCollision: !!confirmCollision });
+  if (result === "IsSelf") {
+    showStatus("That's your own card - refusing to pin yourself.", true);
+    return;
+  }
   if (result.NeedsCollisionConfirmation) {
     const existing = result.NeedsCollisionConfirmation.existing;
     if (confirm(`"${label}" is already used by: ${describeCollision(existing)}. Pin this as a second, different peer anyway?`)) {
@@ -194,7 +285,13 @@ async function doAddPeer(label, card, confirmCollision) {
     showStatus("Add-peer cancelled.", false);
     return;
   }
-  showStatus(describeAddPeerOutcome(result.Outcome), false);
+  let message = describeAddPeerOutcome(result.Outcome.outcome);
+  // D-B: re-adding a previously deleted-and-blocked key restores the pin but never
+  // lifts the block - say so plainly, never silently leave it undiscoverable.
+  if (result.Outcome.still_blocked) {
+    message += " Note: this key is still blocked - mail from them will keep being dropped until you unblock it.";
+  }
+  showStatus(message, false);
   await refreshPeers();
 }
 

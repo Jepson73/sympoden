@@ -18,10 +18,12 @@
     .trust-own { color: #555; font-style: italic; }
     .trust-unknown { color: #a00; font-weight: bold; }
     .fingerprint { color: #888; font-family: monospace; font-size: 0.85em; }
-    ul#peer-list, ul#recipient-list { list-style: none; padding: 0; }
-    ul#peer-list li, ul#recipient-list li { padding: 0.2rem 0; }
+    ul#peer-list, ul#recipient-list, ul#blocked-list { list-style: none; padding: 0; }
+    ul#peer-list li, ul#recipient-list li, ul#blocked-list li { padding: 0.2rem 0; }
     .relabel-form { display: inline; margin-left: 0.5rem; }
     .relabel-form input { width: 8rem; display: inline; }
+    .peer-actions { display: inline; margin-left: 0.5rem; }
+    .peer-actions label { font-size: 0.85em; color: #555; }
   </style>
 </head>
 <body>
@@ -50,6 +52,11 @@
 
     <h2>Peers</h2>
     <ul id="peer-list"></ul>
+
+    <h2>Blocked keys</h2>
+    <p>A blocked key's mail is dropped before it's stored - it does not stop them
+       sending, and does not tell them anything changed.</p>
+    <ul id="blocked-list"></ul>
 
     <h2>Write a note</h2>
     <textarea id="note-body" rows="3" placeholder="What's on your mind?"></textarea>
