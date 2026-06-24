@@ -65,8 +65,10 @@ async function refreshNotes() {
     // "Block sender" passes the note's own author_pubkey directly - the exact key
     // already present in this note, never through label/fingerprint resolution. This
     // is the only route to block a stranger from the notes list itself (they have no
-    // peer row to act on).
-    li.innerHTML = `<div>${escapeHtml(item.note.body)}</div><div class="meta">${when} — <span class="${cssClass}">${escapeHtml(trustText)}</span> ${fingerprintSpan(item.fingerprint)} <button data-block-sender="${escapeHtml(item.note.author_pubkey)}">Block sender</button></div>`;
+    // peer row to act on). Omitted for the user's own notes - blocking yourself is
+    // meaningless (post_note never checks is_blocked).
+    const blockBtn = item.trust === "Own" ? "" : ` <button data-block-sender="${escapeHtml(item.note.author_pubkey)}">Block sender</button>`;
+    li.innerHTML = `<div>${escapeHtml(item.note.body)}</div><div class="meta">${when} — <span class="${cssClass}">${escapeHtml(trustText)}</span> ${fingerprintSpan(item.fingerprint)}${blockBtn}</div>`;
     notesList.appendChild(li);
   }
   for (const button of notesList.querySelectorAll("[data-block-sender]")) {
