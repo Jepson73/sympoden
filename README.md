@@ -7,11 +7,12 @@
 
 ## Status
 
-**Slices 01–03 shipped.** Identity + local note + async sync through one blind
+**Slices 01–04 shipped.** Identity + local note + async sync through one blind
 relay (Slice 01), trust-on-first-use author↔peer binding on top of it (Slice 02),
-and a key-as-identity peer model with multi-peer send (Slice 03) are all
-code-complete, headless-verified, and GUI-verified — see `docs/slices/SLICE-01.md`,
-`SLICE-02.md`, and `SLICE-03.md`. Next up is Phase 1 work per `docs/ROADMAP.md`.
+a key-as-identity peer model with multi-peer send (Slice 03), and receive-side
+consent — delete a peer, block a key (Slice 04) — are all code-complete,
+headless-verified, and GUI-verified — see `docs/slices/SLICE-01.md`, `SLICE-02.md`,
+`SLICE-03.md`, and `SLICE-04.md`. Next up is Phase 1 work per `docs/ROADMAP.md`.
 Everything in these docs remains a *draft to be tested against reality* — the two
 genuinely unsolved problems can only be answered by building further (see below).
 
@@ -41,6 +42,7 @@ decision contradicts one, the decision is wrong — not the invariant. Full text
 | `docs/slices/SLICE-01.md` | The first prototype spec (shipped) | To see what's built |
 | `docs/slices/SLICE-02.md` | The TOFU trust-layer spec (shipped) | To see what's built |
 | `docs/slices/SLICE-03.md` | The key-as-identity + multi-peer send spec (shipped) | To see what's built |
+| `docs/slices/SLICE-04.md` | The receive-side consent spec: delete a peer, block a key (shipped) | To see what's built |
 | `docs/RECONCILIATION.md` | Maps the original 24 ADRs to this foundation | When touching an ADR |
 | `docs/GLOSSARY.md` | Shared vocabulary | When a term is unclear |
 
@@ -78,4 +80,12 @@ Ed25519 key, and the label is just a non-unique local alias — so the same name
 on two different keys, told apart by a short fingerprint, without collision. It lifts
 the single-peer cap: a note can be broadcast to every pinned peer or directed to a
 chosen subset, sealed per recipient and pushed to each, with per-recipient delivery
-state so a partial send retries only the unsent. See `docs/ROADMAP.md` for what's next.
+state so a partial send retries only the unsent.
+
+`docs/slices/SLICE-04.md` added the receive side of consent: a peer can be deleted
+(unpinned), reclassifying their existing notes to Unknown without erasing anything, and
+a key can be blocked — independent of whether it's pinned — so a subsequently received
+note from it is decrypted and verified, then dropped before it's ever stored. Delete and
+block are separable underneath (their own table, no shared row) and independently
+invokable, with a coupled default either half can opt out of. See `docs/ROADMAP.md` for
+what's next.
