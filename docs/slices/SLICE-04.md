@@ -488,13 +488,29 @@ isolation against a hand-typed key. Folded into AC3 and the demo section below.
 
 ## Status
 
-**Spec approved 2026-06-24, implementation not yet started.** D-A, D-B, D-C, and D-E are
-approved as originally specified. D-D is overruled in one respect — self-add rejection
-moves from inside `Store::add_peer` to a guard at the CLI's and app's call sites, keeping
-`Store` identity-free — and folded in above; everything else in D-D (idempotent
-`block_key`/`unblock_key`/`delete_peer`, no new `StoreError` variants) stands as written.
-AC3, AC6, AC8, and AC9 are sharpened with explicit end-to-end exercises (D-E's
-unknown-sender path; the pushed-vs-pending split, now its own AC10; the GUI's
-independent delete/block controls), and ACs are renumbered accordingly through AC12. No
-`Store`/CLI/app code is written yet; implementation proceeds on these terms next, on the
-same commit-discipline terms as Slice 03 (small reviewable commits, no push, no tag).
+**Code-complete and headless-verified.** `cargo test --workspace` (113 tests: 23 app, 82
+engine, 8 relay, 0 cli-unit) and `cargo clippy --workspace --all-targets -- -D warnings`
+are clean; `cargo build -p sympoden-app` succeeds; the extended `scripts/demo.sh`
+demonstrates AC1–AC7 and AC9 end to end against a live relay — delete reclassifying
+existing notes Unknown and re-add repainting them Known, delete-without-block and
+block-without-delete each independently exercised, the coupled default delete+block, a
+never-pinned stranger blocked by the exact key `list` prints (D-E), a re-added
+deleted-and-blocked peer's mail still dropping with the re-add path saying so (D-B), and
+the not-yet-pushed pending-send purge on delete. AC10, and AC9's
+already-pushed-row-survives half, are `cargo test`-only — there is no CLI send-history
+surface for `scripts/demo.sh` to observe, per those ACs' own scoping. `git diff
+bf48e04..HEAD` (the commit at the start of this slice) confirms `crypto.rs`,
+`content.rs`, `sync.rs`, and `trust.rs`, and the entire `relay` crate are byte-for-byte
+unchanged.
+
+**GUI-verified (2026-06-24).** A manual walkthrough across three live Tauri instances
+against a running relay confirmed: deleting a peer reclassifies their existing notes to
+Unknown, and re-adding repaints them Known, both without invoking Sync (the
+render-on-pin property, closing AC8 — the last GUI-only gap this slice's closeout held
+open); a blocked sender's note drops at receipt, before storage; block-without-delete
+(the peer row's standalone Block button) and delete-without-block (the "keep unblocked"
+checkbox) are each independently invokable, distinct from the default Remove button's
+delete+block coupling; add-peer refuses to pin one's own card; a never-pinned sender can
+be blocked via the per-note "Block sender" action (D-E); and deleting a peer purges
+their not-yet-pushed pending send while an already-delivered note to/from another peer
+stays untouched (AC9).

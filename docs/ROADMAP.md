@@ -61,34 +61,44 @@ Slice 01's request-size cap (resolves Slice 01's accepted lazy-expiry gap); clos
 Slice 01/02's accepted sender-authorization gap at the protocol level (today, an unknown
 sender's note is labeled, not blocked — see `docs/ARCHITECTURE.md` §9).
 
-**Tracked cleanup:** `notes.synced_at` (`StoredNote.synced_at`) has been dead since
-Slice 03 — `note_sends` is sole source of truth for delivery state, and the column is
-only ever written, never read back into a decision. Remove the column, the struct field,
-and `content.rs::to_stored()`'s `synced_at: None` the next time a slice is already
-touching `content.rs` for another reason; don't let it become permanent by default.
+**Shipped (Slice 04) — receive-side consent surface:** delete (unpin) a peer — their
+past notes reclassify to Unknown via the existing recompute-at-display path, the pin-flip
+in reverse, nothing erased — and block a key, independent of whether it's pinned, so a
+subsequently received note from it is decrypted/verified then dropped before storage.
+Delete and block are separable underneath (own table, no foreign key) and independently
+invokable from both the CLI and the GUI, with a coupled default (delete also blocks)
+that either half can opt out of. Also shipped alongside: self-add rejection (`add_peer`
+refuses the caller's own card) and render-on-pin (the rendered notes list refreshes on
+any peer-table change without a manual Sync). See `docs/slices/SLICE-04.md`. *Mute*
+(received-but-display-suppressed) was deliberately deferred — see the UX-polish cluster
+below — as was the mutual-connection handshake (§6's named eventual completion of this
+consent surface).
 
-**Slice 04 candidate — receive-side consent surface:**
-- *Block / mute*: a local deny-list of keys. Block drops/hides inbound from a key; mute
-  receives but doesn't surface it. Applies equally to unknown senders (by key/fingerprint)
-  and pinned peers. Fully local — the real anti-harassment lever, and the actual answer to
-  Slice 01/02/03's accepted "no receive-side consent gate" limitation.
-- *Delete / unpin peer*: remove a peer; their past notes reclassify to unknown via the
-  existing recompute-at-display path (the pin-flip in reverse) but they can still reach
-  you — delete forgets the name, block refuses the content; the two are orthogonal and
-  both are needed. Settle at slice time what happens to pending `note_sends` rows and
-  already-received notes addressed to/from the deleted peer (received notes stay and
-  reclassify; pending sends need an explicit decision, not an accident).
-
-**Forbid self-add:** reject `add_peer` when the card's key is the caller's own
-(`"that's your own card"`). Slice 03's Own-beats-peer classification already makes
-self-add harmless either way, so this is zero-risk tidiness, not a fix for a live bug.
-
-**UX — render-on-pin:** refresh the rendered notes list on any peer-table change
-(pin/unpin/relabel) without requiring a manual Sync Now — the unknown→known flip is a
-local recompute against already-stored notes, no network round trip needed.
-
-**UX — auto-sync-on-post:** posting should also push automatically; the current
-manual-only Sync Now is correct for dev/testing but is a later convenience to add.
+**UX polish (near-term, unscheduled backlog — a note to not lose, not a slice to build
+yet):**
+- **Blocked-list display & information architecture.** Block keys on `ed25519_pubkey`
+  underneath — correct and unchanged; the items below are *display only*, never a change
+  to what block keys on.
+  - *Block-while-pinned* should show the peer's **current label**, resolved at display
+    time from the peers table (not snapshotted) — the user still has a relationship with
+    that key, and a name aids recognition. Bare fingerprint/key when no pin exists.
+  - *Block-and-delete* keys belong in a **separate cut-off list** — inspectable but
+    passive, keys-only by design (the name was deliberately forgotten on delete, and this
+    surface exists to be rarely opened, not to re-introduce a remembered name). A distinct
+    surface from block-while-pinned, not the same list — recognize-but-refuse and
+    cut-off-and-done are different purposes.
+  - Full key remains available on demand per user setting, in both cases.
+- **Mute**: a third, softer mechanism alongside delete and block (received-and-kept but
+  display-suppressed) — needs its own table and a display-path filter. Deferred at
+  Slice 04 (see `docs/slices/SLICE-04.md` NON-GOALS); a clean fast-follow once delete and
+  block are proven.
+- **Auto-sync-on-post**: posting should also push automatically; the current manual-only
+  Sync Now is correct for dev/testing but is a later convenience to add.
+- **`notes.synced_at` cleanup**: inert since Slice 03 (`note_sends` is sole source of
+  truth for delivery state) and held at zero-diff through Slice 04 too — remove the
+  column, the struct field, and `content.rs::to_stored()`'s `synced_at: None` the next
+  time a slice is already touching `content.rs` for another reason; don't let it become
+  permanent by default.
 
 A related, still-open distinction to design deliberately here rather than improvise: peer
 **exchange** UX when a channel already exists between two people (e.g. a QR code, a
