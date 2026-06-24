@@ -413,23 +413,31 @@ isolation against a hand-typed key. Folded into AC3 and the demo section below.
 9. Deleting a peer purges any not-yet-pushed `note_sends` row addressed to them
    (decided fork, D-A/Components): the pair disappears from `pending_sends()`
    immediately, and re-adding the same key afterward does **not** resurrect or push it —
-   only notes posted after the re-add can be addressed to them again. An already-pushed
-   `note_sends` row for that key is left untouched (historical record, not re-sent,
-   never resurrected either way).
+   only notes posted after the re-add can be addressed to them again. This user-visible
+   half (no resurrected push to a re-added peer) is what `scripts/demo.sh` exercises. An
+   already-pushed `note_sends` row for that key is left untouched (historical record, not
+   re-sent, never resurrected either way) — this half is **Store-level unit-tested only**
+   (see AC10): there is no CLI send-history surface to observe a surviving row through,
+   and "survived" vs. "was deleted" are behaviorally indistinguishable from outside (both
+   mean no re-push), so demo.sh has nothing to assert here.
 10. **Pushed-vs-pending split, exercised concretely** (ruled 2026-06-24, sharpening AC9):
     a peer holding **both** a pushed (`pushed_at` set) and a pending (`pushed_at NULL`)
     `note_sends` row at the moment of deletion. After delete: the pushed row survives
     untouched — still present, still queryable as the historical record of what was
-    actually sent — and the pending row is gone, absent from `pending_sends()`. This is
-    one test distinguishing the two rows by `pushed_at`, not an inference drawn from AC9's
-    general statement.
+    actually sent — and the pending row is gone, absent from `pending_sends()`. **This is
+    a `store.rs` unit test, not a `scripts/demo.sh` assertion** — proving "survived"
+    requires querying `note_sends` directly through the encrypted `Store`, which the CLI
+    has no command exposing, and which demo.sh therefore cannot observe from outside.
 11. **Zero-diff:** `git diff <slice-start>..HEAD -- sympoden-engine/src/crypto.rs
     sympoden-engine/src/content.rs sympoden-engine/src/sync.rs sympoden-engine/src/trust.rs
     sympoden-relay/` is empty.
 12. `cargo test --workspace` green, `cargo clippy --workspace --all-targets -- -D
     warnings` clean, `cargo build -p sympoden-app` succeeds. `scripts/demo.sh` green,
-    covering ACs 1–7, 9, and 10 end to end against a live relay, extending (not
-    replacing) Slice 01–03's existing coverage.
+    covering ACs 1–7 and AC9's user-visible half end to end against a live relay,
+    extending (not replacing) Slice 01–03's existing coverage. **AC10, and AC9's
+    already-pushed-row-survives half, are covered by `cargo test` only** — not by
+    `scripts/demo.sh` — per the encrypted-store/no-send-history-surface reasoning in
+    those ACs.
 
 ## Explicit NON-GOALS (do not build these in Slice 04)
 
