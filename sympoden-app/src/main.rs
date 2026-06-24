@@ -24,7 +24,7 @@ use thiserror::Error;
 use sympoden_engine::content::Note;
 use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError};
 use sympoden_engine::identity::{Identity, PublicCard, fingerprint_hex, format_fingerprint};
-use sympoden_engine::store::{AddPeerOutcome, PinnedPeer, SendTargets, Store};
+use sympoden_engine::store::{AddPeerOutcome, BlockedKey, PinnedPeer, SendTargets, Store};
 use sympoden_engine::sync::{self, RelayClient};
 use sympoden_engine::trust::{self, TrustedNote};
 
@@ -133,7 +133,35 @@ impl From<TrustedNote> for NoteView {
 #[derive(Debug, Serialize)]
 enum AddPeerResult {
     NeedsCollisionConfirmation { existing: Vec<PeerView> },
-    Outcome(AddPeerOutcome),
+    /// SLICE-04.md D-D: a call-site guard, not an engine check - `Store::AddPeerOutcome`
+    /// gains nothing, this is an outcome of the Tauri command alone.
+    IsSelf,
+    Outcome {
+        outcome: AddPeerOutcome,
+        /// SLICE-04.md D-B: re-adding a previously deleted-and-blocked key restores
+        /// the pin but never lifts the block - this tells the frontend so it can say
+        /// so plainly, the same notice the CLI prints inline.
+        still_blocked: bool,
+    },
+}
+
+/// A blocked key as shown to the frontend: the key itself plus its display
+/// fingerprint and when it was blocked - mirrors `PeerView`'s shape.
+#[derive(Debug, Serialize)]
+struct BlockedKeyView {
+    ed25519_pubkey: String,
+    fingerprint: String,
+    blocked_at: i64,
+}
+
+impl From<&BlockedKey> for BlockedKeyView {
+    fn from(blocked: &BlockedKey) -> Self {
+        Self {
+            ed25519_pubkey: blocked.ed25519_pubkey.clone(),
+            fingerprint: format_fingerprint(&fingerprint_hex(&blocked.ed25519_pubkey)),
+            blocked_at: blocked.blocked_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +214,14 @@ fn add_peer_card(
     let ed25519_pubkey = hex::encode(parsed.ed25519_verifying_key()?.as_bytes());
     let x25519_pubkey = hex::encode(parsed.x25519_public_key()?.to_bytes());
 
+    // Self-add rejection (SLICE-04.md D-D): a call-site guard, not an engine check -
+    // Store stays identity-free. Rejected before check_label_collision or add_peer is
+    // ever reached, so the engine never sees the candidate key.
+    let my_key_hex = hex::encode(session.identity.signing_key.verifying_key().as_bytes());
+    if ed25519_pubkey == my_key_hex {
+        return Ok(AddPeerResult::IsSelf);
+    }
+
     if !confirm_collision && session.store.get_peer_by_key(&ed25519_pubkey)?.is_none() {
         let collisions = session.store.check_label_collision(label, &ed25519_pubkey)?;
         if !collisions.is_empty() {
@@ -198,7 +234,13 @@ fn add_peer_card(
     let outcome = session
         .store
         .add_peer(label, &ed25519_pubkey, &x25519_pubkey, now_unix())?;
-    Ok(AddPeerResult::Outcome(outcome))
+    // D-B: re-adding a previously deleted-and-blocked key restores the pin but never
+    // lifts the block - surfaced here so it's not undiscoverable.
+    let still_blocked = session.store.is_blocked(&ed25519_pubkey)?;
+    Ok(AddPeerResult::Outcome {
+        outcome,
+        still_blocked,
+    })
 }
 
 /// Rename a pinned peer's label, addressed by the peer's exact key.
@@ -234,6 +276,44 @@ fn relabel_peer_now(
 
 fn list_peers_inner(session: &Session) -> Result<Vec<PeerView>, AppError> {
     Ok(session.store.list_peers()?.iter().map(PeerView::from).collect())
+}
+
+/// Unpin a peer. By default also blocks their key (the coupled default action);
+/// `keep_unblocked: true` is the delete-without-block escape hatch, so the two stay
+/// independently invokable from the frontend (SLICE-04.md's stated UI requirement).
+fn remove_peer_now(
+    session: &Session,
+    ed25519_pubkey: &str,
+    keep_unblocked: bool,
+) -> Result<(), AppError> {
+    session.store.delete_peer(ed25519_pubkey)?;
+    if !keep_unblocked {
+        session.store.block_key(ed25519_pubkey, now_unix())?;
+    }
+    Ok(())
+}
+
+/// Standalone block-without-delete: never touches `peers` (D-A's separable-underneath
+/// property). Takes the peer's/sender's exact key, the same way `relabel_peer_now`
+/// does - the frontend already holds it, from `list_peers` or a note's own
+/// `author_pubkey`, never a typed query to resolve.
+fn block_key_now(session: &Session, ed25519_pubkey: &str) -> Result<(), AppError> {
+    session.store.block_key(ed25519_pubkey, now_unix())?;
+    Ok(())
+}
+
+fn unblock_key_now(session: &Session, ed25519_pubkey: &str) -> Result<(), AppError> {
+    session.store.unblock_key(ed25519_pubkey)?;
+    Ok(())
+}
+
+fn list_blocked_inner(session: &Session) -> Result<Vec<BlockedKeyView>, AppError> {
+    Ok(session
+        .store
+        .list_blocked()?
+        .iter()
+        .map(BlockedKeyView::from)
+        .collect())
 }
 
 /// `recipients`: `None` or an empty list addresses every currently pinned peer
@@ -293,10 +373,19 @@ fn sync_now_inner(session: &Session, relay: String) -> Result<SyncResult, AppErr
     let my_routing_key = sympoden_engine::crypto::routing_key_for(&my_key);
     let received = match client.pull(&my_routing_key)? {
         Some(envelope_bytes) => {
+            // receive_incoming (decrypt, verify) is unchanged (SLICE-04.md D-C) - the
+            // block check is a new step between it and insert_note. The relay has
+            // already freed this recipient's slot by the pull above, regardless of
+            // what happens next.
             let note = sync::receive_incoming(&envelope_bytes, &session.identity.x25519_secret)?;
-            let trusted = trust::classify_stored_note(note.to_stored(), &my_key, &peers)?;
-            session.store.insert_note(trusted.note())?;
-            Some(NoteView::from(trusted))
+            let author_hex = hex::encode(note.author_pubkey.as_bytes());
+            if session.store.is_blocked(&author_hex)? {
+                None
+            } else {
+                let trusted = trust::classify_stored_note(note.to_stored(), &my_key, &peers)?;
+                session.store.insert_note(trusted.note())?;
+                Some(NoteView::from(trusted))
+            }
         }
         None => None,
     };
@@ -402,6 +491,50 @@ fn list_peers(state: State<AppState>) -> Result<Vec<PeerView>, String> {
 }
 
 #[tauri::command]
+fn remove_peer(
+    state: State<AppState>,
+    ed25519_pubkey: String,
+    keep_unblocked: bool,
+) -> Result<(), String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "internal error".to_string())?;
+    let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
+    remove_peer_now(session, &ed25519_pubkey, keep_unblocked).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn block_key(state: State<AppState>, ed25519_pubkey: String) -> Result<(), String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "internal error".to_string())?;
+    let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
+    block_key_now(session, &ed25519_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn unblock_key(state: State<AppState>, ed25519_pubkey: String) -> Result<(), String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "internal error".to_string())?;
+    let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
+    unblock_key_now(session, &ed25519_pubkey).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_blocked(state: State<AppState>) -> Result<Vec<BlockedKeyView>, String> {
+    let guard = state
+        .session
+        .lock()
+        .map_err(|_| "internal error".to_string())?;
+    let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
+    list_blocked_inner(session).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn post_note(
     state: State<AppState>,
     body: String,
@@ -463,6 +596,10 @@ fn main() {
             add_peer,
             relabel_peer,
             list_peers,
+            remove_peer,
+            block_key,
+            unblock_key,
+            list_blocked,
             post_note,
             sync_now,
             list_notes,
@@ -638,13 +775,19 @@ mod tests {
         let first = add_peer_card(&session, "bob", &bob_card, false).unwrap();
         assert!(matches!(
             first,
-            AddPeerResult::Outcome(AddPeerOutcome::Added)
+            AddPeerResult::Outcome {
+                outcome: AddPeerOutcome::Added,
+                ..
+            }
         ));
 
         let second = add_peer_card(&session, "carol", &carol_card, false).unwrap();
         assert!(matches!(
             second,
-            AddPeerResult::Outcome(AddPeerOutcome::Added)
+            AddPeerResult::Outcome {
+                outcome: AddPeerOutcome::Added,
+                ..
+            }
         ));
 
         assert_eq!(list_peers_inner(&session).unwrap().len(), 2);
@@ -682,7 +825,10 @@ mod tests {
         let confirmed = add_peer_card(&session, "bob", &eve_card, true).unwrap();
         assert!(matches!(
             confirmed,
-            AddPeerResult::Outcome(AddPeerOutcome::Added)
+            AddPeerResult::Outcome {
+                outcome: AddPeerOutcome::Added,
+                ..
+            }
         ));
         assert_eq!(list_peers_inner(&session).unwrap().len(), 2);
     }
@@ -700,7 +846,10 @@ mod tests {
         let result = add_peer_card(&session, "robert", &bob_card, false).unwrap();
 
         match result {
-            AddPeerResult::Outcome(AddPeerOutcome::AlreadyPinnedUnderLabel { existing_label }) => {
+            AddPeerResult::Outcome {
+                outcome: AddPeerOutcome::AlreadyPinnedUnderLabel { existing_label },
+                ..
+            } => {
                 assert_eq!(existing_label, "bob");
             }
             other => panic!("expected AlreadyPinnedUnderLabel, got {other:?}"),
@@ -978,5 +1127,167 @@ mod tests {
         let pending = alice.store.pending_sends().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].peer.label, "bob");
+    }
+
+    // -- Slice 04: delete a peer, block a key --
+
+    #[test]
+    fn add_peer_card_rejects_pinning_ones_own_whoami_card() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let own_card = serde_json::to_string(&whoami_card(&session)).unwrap();
+
+        let result = add_peer_card(&session, "myself", &own_card, false).unwrap();
+
+        assert!(matches!(result, AddPeerResult::IsSelf));
+        assert_eq!(list_peers_inner(&session).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_peer_reclassifies_existing_notes_to_unknown_and_readd_restores_known() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        let bob_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
+
+        // A note authored by Bob, inserted directly (as if it had arrived via sync).
+        session
+            .store
+            .insert_note(&sympoden_engine::store::StoredNote {
+                id: "note-from-bob".to_string(),
+                author_pubkey: bob_key.clone(),
+                body: "hi".to_string(),
+                created_at: 1_700_000_000,
+                signature: "deadbeef".to_string(),
+                synced_at: None,
+            })
+            .unwrap();
+        assert_eq!(
+            list_notes_inner(&session).unwrap()[0].trust,
+            sympoden_engine::trust::AuthorTrust::Known("bob".to_string())
+        );
+
+        remove_peer_now(&session, &bob_key, true).unwrap();
+        assert_eq!(
+            list_notes_inner(&session).unwrap()[0].trust,
+            sympoden_engine::trust::AuthorTrust::Unknown
+        );
+
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        assert_eq!(
+            list_notes_inner(&session).unwrap()[0].trust,
+            sympoden_engine::trust::AuthorTrust::Known("bob".to_string())
+        );
+    }
+
+    #[test]
+    fn remove_peer_default_couples_block_keep_unblocked_does_not() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        let bob_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
+
+        remove_peer_now(&session, &bob_key, false).unwrap();
+        assert!(session.store.is_blocked(&bob_key).unwrap());
+
+        // Re-pin and delete again, this time keeping it unblocked.
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        session.store.unblock_key(&bob_key).unwrap();
+        remove_peer_now(&session, &bob_key, true).unwrap();
+        assert!(!session.store.is_blocked(&bob_key).unwrap());
+    }
+
+    #[test]
+    fn block_key_now_works_on_a_never_pinned_sender() {
+        // The stranger case (D-A): block_key_now never resolves through peers - it
+        // takes the exact key directly, the same way a note's author_pubkey would be
+        // passed from a "block this sender" frontend action.
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+
+        block_key_now(&session, "ed-a-stranger-who-was-never-pinned").unwrap();
+
+        assert!(
+            session
+                .store
+                .is_blocked("ed-a-stranger-who-was-never-pinned")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn re_adding_after_delete_and_block_surfaces_still_blocked_in_the_result() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        let bob_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
+
+        remove_peer_now(&session, &bob_key, false).unwrap(); // delete + block (default)
+
+        let result = add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        match result {
+            AddPeerResult::Outcome {
+                outcome: AddPeerOutcome::Added,
+                still_blocked,
+            } => assert!(still_blocked, "D-B: re-add must report the standing block"),
+            other => panic!("expected Outcome::Added, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_now_drops_a_note_from_a_blocked_sender_before_storing_it() {
+        let workdir = tempdir().unwrap();
+        let alice_dir = workdir.path().join("alice");
+        let bob_dir = workdir.path().join("bob");
+        fs::create_dir_all(&alice_dir).unwrap();
+        fs::create_dir_all(&bob_dir).unwrap();
+
+        let alice = create_identity_session(&alice_dir, "alice-pass").unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+
+        let bob_card_json = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        add_peer_card(&alice, "bob", &bob_card_json, false).unwrap();
+        let alice_card_json = serde_json::to_string(&whoami_card(&alice)).unwrap();
+        add_peer_card(&bob, "alice", &alice_card_json, false).unwrap();
+
+        post_note_now(&alice, "hello bob".to_string(), 1_700_000_000, None).unwrap();
+        let relay_addr = start_test_relay();
+        sync_now_inner(&alice, relay_addr.to_string()).unwrap();
+
+        // Bob blocks Alice's key before syncing - the note is decrypted/verified
+        // (unchanged path) and then dropped, never stored, never returned.
+        let alice_key = list_peers_inner(&bob).unwrap()[0].ed25519_pubkey.clone();
+        block_key_now(&bob, &alice_key).unwrap();
+
+        let bob_sync = sync_now_inner(&bob, relay_addr.to_string()).unwrap();
+        assert!(bob_sync.received.is_none());
+        assert_eq!(list_notes_inner(&bob).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_blocked_reflects_block_and_unblock() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+
+        block_key_now(&session, "ed-bob").unwrap();
+        block_key_now(&session, "ed-carol").unwrap();
+        assert_eq!(list_blocked_inner(&session).unwrap().len(), 2);
+
+        unblock_key_now(&session, "ed-bob").unwrap();
+        let blocked = list_blocked_inner(&session).unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].ed25519_pubkey, "ed-carol");
     }
 }
