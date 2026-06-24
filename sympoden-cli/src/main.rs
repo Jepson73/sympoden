@@ -64,6 +64,23 @@ enum Command {
     },
     /// List all pinned peers, each shown as label and fingerprint.
     ListPeers,
+    /// Unpin a peer, addressed by label, fingerprint, or "label#fingerprint". By
+    /// default also blocks their key (the coupled default action) - pass
+    /// --keep-unblocked to delete without blocking.
+    DeletePeer {
+        query: String,
+        #[arg(long)]
+        keep_unblocked: bool,
+    },
+    /// Block a key so a note subsequently received from it is dropped before being
+    /// stored. Accepts a pinned peer's label/fingerprint/"label#fingerprint", or a
+    /// literal 64-hex Ed25519 key for a sender who was never pinned (see `list`'s
+    /// trailing key field).
+    Block { key_or_query: String },
+    /// Lift a block. Same addressing as `block`.
+    Unblock { key_or_query: String },
+    /// List every currently blocked key.
+    ListBlocked,
     /// Write and sign a new note, stored locally, addressed to all pinned peers
     /// (broadcast, the default) or to an explicit subset (repeatable --to).
     Post {
@@ -130,6 +147,13 @@ fn run(cli: Cli) -> Result<(), CliError> {
             strict,
         } => cmd_relabel_peer(&cli.data_dir, &query, &new_label, strict),
         Command::ListPeers => cmd_list_peers(&cli.data_dir),
+        Command::DeletePeer {
+            query,
+            keep_unblocked,
+        } => cmd_delete_peer(&cli.data_dir, &query, keep_unblocked),
+        Command::Block { key_or_query } => cmd_block(&cli.data_dir, &key_or_query, true),
+        Command::Unblock { key_or_query } => cmd_block(&cli.data_dir, &key_or_query, false),
+        Command::ListBlocked => cmd_list_blocked(&cli.data_dir),
         Command::Post { body, to } => cmd_post(&cli.data_dir, body, to),
         Command::Sync { relay } => cmd_sync(&cli.data_dir, &relay),
         Command::List => cmd_list(&cli.data_dir),
@@ -238,6 +262,15 @@ fn cmd_add_peer(dir: &Path, label: &str, card: &str, strict: bool) -> Result<(),
     let ed25519_pubkey = hex::encode(parsed.ed25519_verifying_key()?.as_bytes());
     let x25519_pubkey = hex::encode(parsed.x25519_public_key()?.to_bytes());
 
+    // Self-add rejection (SLICE-04.md D-D): a call-site guard, not an engine check -
+    // Store stays identity-free. Rejected before check_label_collision or add_peer is
+    // ever reached, so the engine never sees the candidate key.
+    let my_key_hex = hex::encode(identity.signing_key.verifying_key().as_bytes());
+    if ed25519_pubkey == my_key_hex {
+        println!("that's your own card - refusing to pin yourself");
+        return Ok(());
+    }
+
     // The collision pre-check only matters for a genuinely new key - if this key is
     // already pinned, add_peer's own outcome (AlreadyPinned/AlreadyPinnedUnderLabel)
     // is the whole story and nothing new is being written.
@@ -252,6 +285,14 @@ fn cmd_add_peer(dir: &Path, label: &str, card: &str, strict: bool) -> Result<(),
         AddPeerOutcome::AlreadyPinnedUnderLabel { existing_label } => {
             println!("already pinned as \"{existing_label}\" - use relabel-peer to rename");
         }
+    }
+
+    // D-B: re-adding a previously deleted-and-blocked key restores the pin but never
+    // lifts the block - say so plainly rather than leaving it undiscoverable.
+    if store.is_blocked(&ed25519_pubkey)? {
+        println!(
+            "Note: this key is still blocked - mail from them will keep being dropped until you unblock it."
+        );
     }
     Ok(())
 }
@@ -277,6 +318,83 @@ fn cmd_list_peers(dir: &Path) -> Result<(), CliError> {
 
     for peer in store.list_peers()? {
         println!("{}", describe_peer(&peer));
+    }
+    Ok(())
+}
+
+/// Unpin a peer. By default also blocks their key (the coupled default action,
+/// SLICE-04.md's "may couple them as one default action"); `--keep-unblocked` is the
+/// delete-without-block escape hatch, so the two stay independently expressible.
+fn cmd_delete_peer(dir: &Path, query: &str, keep_unblocked: bool) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let store = Store::open(&db_path(dir), &identity.db_key)?;
+    let peers = store.list_peers()?;
+
+    let target = resolve_peer_query(query, &peers)?.clone();
+    store.delete_peer(&target.ed25519_pubkey)?;
+    if !keep_unblocked {
+        store.block_key(&target.ed25519_pubkey, now_unix())?;
+    }
+
+    println!(
+        "Deleted \"{}\"{}",
+        target.label,
+        if keep_unblocked {
+            " (left unblocked)."
+        } else {
+            " and blocked their key."
+        }
+    );
+    Ok(())
+}
+
+/// Resolve a block/unblock target: try `resolve_peer_query` first (the common
+/// "address a pinned peer" case); on no match there, fall back to treating the
+/// argument as a literal 64-hex Ed25519 key (the stranger case, SLICE-04.md D-E) -
+/// never inventing a second matching mechanism, just falling back to the one thing a
+/// key always is.
+fn resolve_block_target(key_or_query: &str, peers: &[PinnedPeer]) -> Result<String, CliError> {
+    match resolve_peer_query(key_or_query, peers) {
+        Ok(peer) => Ok(peer.ed25519_pubkey.clone()),
+        Err(err @ (StoreError::UnknownPeerKey { .. } | StoreError::AmbiguousPeerQuery { .. })) => {
+            if key_or_query.len() == 64 && hex::decode(key_or_query).is_ok() {
+                Ok(key_or_query.to_string())
+            } else {
+                Err(err.into())
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Standalone block-without-delete / unblock path: `key_or_query` never touches
+/// `peers` (D-A's separable-underneath property).
+fn cmd_block(dir: &Path, key_or_query: &str, block: bool) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let store = Store::open(&db_path(dir), &identity.db_key)?;
+    let peers = store.list_peers()?;
+
+    let key = resolve_block_target(key_or_query, &peers)?;
+    if block {
+        store.block_key(&key, now_unix())?;
+        println!("Blocked {key}.");
+    } else {
+        store.unblock_key(&key)?;
+        println!("Unblocked {key}.");
+    }
+    Ok(())
+}
+
+fn cmd_list_blocked(dir: &Path) -> Result<(), CliError> {
+    let identity = unlock(dir)?;
+    let store = Store::open(&db_path(dir), &identity.db_key)?;
+
+    for blocked in store.list_blocked()? {
+        println!(
+            "{} ({})",
+            format_fingerprint(&fingerprint_hex(&blocked.ed25519_pubkey)),
+            blocked.blocked_at
+        );
     }
     Ok(())
 }
@@ -365,18 +483,27 @@ fn cmd_sync(dir: &Path, relay_addr: &str) -> Result<(), CliError> {
         sympoden_engine::crypto::routing_key_for(&identity.signing_key.verifying_key());
     match client.pull(&my_routing_key)? {
         Some(envelope_bytes) => {
+            // receive_incoming (decrypt, verify) is unchanged (SLICE-04.md D-C) - the
+            // block check is a new step between it and insert_note. The relay has
+            // already freed this recipient's slot by the pull above, regardless of
+            // what happens next.
             let note = sync::receive_incoming(&envelope_bytes, &identity.x25519_secret)?;
-            let trusted = trust::classify_stored_note(
-                note.to_stored(),
-                &identity.signing_key.verifying_key(),
-                &peers,
-            )?;
-            println!(
-                "Received note from {}: {}",
-                trust_label(trusted.trust(), &trusted.note().author_pubkey),
-                trusted.note().body
-            );
-            store.insert_note(trusted.note())?;
+            let author_hex = hex::encode(note.author_pubkey.as_bytes());
+            if store.is_blocked(&author_hex)? {
+                println!("Dropped a note from a blocked sender.");
+            } else {
+                let trusted = trust::classify_stored_note(
+                    note.to_stored(),
+                    &identity.signing_key.verifying_key(),
+                    &peers,
+                )?;
+                println!(
+                    "Received note from {}: {}",
+                    trust_label(trusted.trust(), &trusted.note().author_pubkey),
+                    trusted.note().body
+                );
+                store.insert_note(trusted.note())?;
+            }
         }
         None => println!("Nothing new from the relay."),
     }
@@ -392,12 +519,18 @@ fn cmd_list(dir: &Path) -> Result<(), CliError> {
 
     for note in store.list_notes()? {
         let trusted = trust::classify_stored_note(note, &my_key, &peers)?;
+        // The trailing full hex key (SLICE-04.md D-E) is the only way to name a
+        // never-pinned sender precisely enough to `block` them - a fingerprint
+        // (inside trust_label) cannot be reversed back into the exact key block_key
+        // needs. Already locally known data (StoredNote::author_pubkey), not new
+        // engine logic - zero diff to content.rs/trust.rs.
         println!(
-            "[{}] {} ({}): {}",
+            "[{}] {} ({}): {} {}",
             trusted.note().created_at,
             &trusted.note().id[..8.min(trusted.note().id.len())],
             trust_label(trusted.trust(), &trusted.note().author_pubkey),
-            trusted.note().body
+            trusted.note().body,
+            trusted.note().author_pubkey
         );
     }
     Ok(())
