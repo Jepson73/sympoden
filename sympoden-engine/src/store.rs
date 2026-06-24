@@ -16,6 +16,10 @@
 //! The `note_sends` table (Slice 03, new) tracks delivery per `(note, recipient key)` —
 //! see SLICE-03.md D7. It is the sole source of truth for what's been pushed to whom;
 //! `notes.synced_at` is not consulted.
+//!
+//! The `blocked_keys` table (Slice 04, new) holds receive-side blocks, keyed on
+//! `ed25519_pubkey` alone — deliberately with no foreign key to `peers` (SLICE-04.md
+//! D-A): a key can be blocked whether or not it is, or ever was, pinned.
 
 use std::path::Path;
 
@@ -86,6 +90,14 @@ pub struct PendingSend {
     pub peer: PinnedPeer,
 }
 
+/// A receive-side block on a key (SLICE-04.md D-A). Independent of `peers`: a key may
+/// be blocked whether or not it is pinned, and blocking never reads or writes `peers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedKey {
+    pub ed25519_pubkey: String, // hex
+    pub blocked_at: i64,        // unix seconds
+}
+
 impl Store {
     /// Open (creating if absent) the SQLCipher-encrypted database at `path`, keyed by
     /// `db_key`. A wrong key fails cleanly on first read, never panics.
@@ -126,6 +138,10 @@ impl Store {
                 peer_key TEXT NOT NULL,
                 pushed_at INTEGER,
                 PRIMARY KEY (note_id, peer_key)
+            );
+            CREATE TABLE IF NOT EXISTS blocked_keys (
+                ed25519_pubkey TEXT PRIMARY KEY,
+                blocked_at INTEGER NOT NULL
             );",
         )?;
 
@@ -250,6 +266,30 @@ impl Store {
         Ok(())
     }
 
+    /// Unpin a peer (SLICE-04.md AC1/AC9). Idempotent — deleting an already-gone peer
+    /// reaches the same end state whether or not a row existed, so this never errors
+    /// (D-D). Trust reclassification needs no further action here: `classify_author`
+    /// (`trust.rs`, unchanged) recomputes from the current `peers` table on every call,
+    /// so the very next `list_notes`/`list` reclassifies every note from this key to
+    /// `Unknown` for free.
+    ///
+    /// Also purges any not-yet-pushed `note_sends` row addressed to this key (the
+    /// decided fork in SLICE-04.md's Components/D-A: deleting cancels the outstanding
+    /// send intent, so re-pinning the same key later doesn't silently resurrect and push
+    /// a long-stale queued note). An already-*pushed* row for this key is left
+    /// untouched — it is the historical record of what was actually sent, never erased.
+    pub fn delete_peer(&self, ed25519_pubkey: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM peers WHERE ed25519_pubkey = ?1",
+            params![ed25519_pubkey],
+        )?;
+        self.conn.execute(
+            "DELETE FROM note_sends WHERE peer_key = ?1 AND pushed_at IS NULL",
+            params![ed25519_pubkey],
+        )?;
+        Ok(())
+    }
+
     /// All pinned peers, sorted by label then first-pinned, so same-labeled peers sort
     /// adjacent for display.
     pub fn list_peers(&self) -> Result<Vec<PinnedPeer>, StoreError> {
@@ -353,6 +393,59 @@ impl Store {
             params![pushed_at, note_id, peer_key],
         )?;
         Ok(())
+    }
+
+    /// Block a key, independent of whether it is pinned (SLICE-04.md D-A). Idempotent —
+    /// blocking an already-blocked key reaches the same end state either way, so this
+    /// never errors (D-D).
+    pub fn block_key(&self, ed25519_pubkey: &str, blocked_at: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blocked_keys (ed25519_pubkey, blocked_at)
+             VALUES (?1, ?2)",
+            params![ed25519_pubkey, blocked_at],
+        )?;
+        Ok(())
+    }
+
+    /// Lift a block. Idempotent — unblocking an already-unblocked key is a no-op, not
+    /// an error (D-D). Has no retroactive effect: notes already dropped while the block
+    /// was active were never kept, and notes stored before the block began stay (the
+    /// no-unsend boundary, FOUNDATION §4).
+    pub fn unblock_key(&self, ed25519_pubkey: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM blocked_keys WHERE ed25519_pubkey = ?1",
+            params![ed25519_pubkey],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this key is currently blocked. Called from the pull loop, between
+    /// `receive_incoming` and `insert_note` (SLICE-04.md D-C) — a `true` here means the
+    /// decrypted, signature-verified note is dropped before it ever reaches `notes`.
+    pub fn is_blocked(&self, ed25519_pubkey: &str) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM blocked_keys WHERE ed25519_pubkey = ?1",
+                params![ed25519_pubkey],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(StoreError::from)
+    }
+
+    /// Every currently blocked key, so blocking isn't write-only.
+    pub fn list_blocked(&self) -> Result<Vec<BlockedKey>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ed25519_pubkey, blocked_at FROM blocked_keys ORDER BY blocked_at ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BlockedKey {
+                ed25519_pubkey: row.get(0)?,
+                blocked_at: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
     }
 }
 
@@ -840,6 +933,199 @@ mod tests {
         store
             .record_pending_sends("note1", &SendTargets::Broadcast)
             .unwrap();
+        assert_eq!(store.pending_sends().unwrap().len(), 0);
+    }
+
+    // -- Slice 04: delete_peer, block_key/unblock_key/is_blocked/list_blocked --
+
+    #[test]
+    fn delete_peer_removes_the_pin_so_the_key_is_no_longer_pinned() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        assert!(store.get_peer_by_key("ed-bob").unwrap().is_some());
+
+        store.delete_peer("ed-bob").unwrap();
+
+        assert!(store.get_peer_by_key("ed-bob").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_peer_is_idempotent_on_an_already_absent_key() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        // No peer named "ed-nobody" was ever pinned - this must not error (D-D).
+        store.delete_peer("ed-nobody").unwrap();
+    }
+
+    #[test]
+    fn delete_peer_purges_only_the_not_yet_pushed_note_sends_row() {
+        // AC9/AC10: a peer holding both a pushed and a pending note_sends row at
+        // delete time. The pushed row is the historical record of what was actually
+        // sent and must survive untouched; only the pending row is purged.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.insert_note(&sample_note("note1", "me", None)).unwrap();
+        store.insert_note(&sample_note("note2", "me", None)).unwrap();
+        store
+            .record_pending_sends("note1", &SendTargets::Directed(vec!["ed-bob".to_string()]))
+            .unwrap();
+        store
+            .record_pending_sends("note2", &SendTargets::Directed(vec!["ed-bob".to_string()]))
+            .unwrap();
+        store.mark_send_pushed("note1", "ed-bob", 1_700_001_000).unwrap();
+        // note2 stays pending (never pushed).
+
+        store.delete_peer("ed-bob").unwrap();
+
+        // The pending row (note2) is gone - querying note_sends directly, since
+        // pending_sends() also requires the peer row, which is now also gone.
+        let pending_row_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM note_sends WHERE note_id = 'note2' AND peer_key = 'ed-bob'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_row_count, 0);
+
+        // The pushed row (note1) survives, untouched, as the historical send record.
+        let pushed_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT pushed_at FROM note_sends WHERE note_id = 'note1' AND peer_key = 'ed-bob'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pushed_at, 1_700_001_000);
+    }
+
+    #[test]
+    fn delete_peer_never_touches_blocked_keys() {
+        // D-A's separable-underneath property: deleting a peer issues no SQL against
+        // blocked_keys at all.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.block_key("ed-bob", 1_700_000_500).unwrap();
+
+        store.delete_peer("ed-bob").unwrap();
+
+        assert!(store.is_blocked("ed-bob").unwrap());
+    }
+
+    #[test]
+    fn block_key_works_on_a_never_pinned_key() {
+        // The stranger case (D-A): no foreign key to peers, so a key that was never
+        // pinned at all can still be blocked.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        assert!(store.get_peer_by_key("ed-stranger").unwrap().is_none());
+
+        store.block_key("ed-stranger", 1_700_000_000).unwrap();
+
+        assert!(store.is_blocked("ed-stranger").unwrap());
+        assert!(store.get_peer_by_key("ed-stranger").unwrap().is_none());
+    }
+
+    #[test]
+    fn block_key_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.block_key("ed-bob", 1_700_000_000).unwrap();
+        store.block_key("ed-bob", 1_700_000_500).unwrap();
+
+        assert!(store.is_blocked("ed-bob").unwrap());
+    }
+
+    #[test]
+    fn unblock_key_lifts_the_block_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.block_key("ed-bob", 1_700_000_000).unwrap();
+        store.unblock_key("ed-bob").unwrap();
+        assert!(!store.is_blocked("ed-bob").unwrap());
+
+        // Unblocking an already-unblocked key must not error (D-D).
+        store.unblock_key("ed-bob").unwrap();
+        assert!(!store.is_blocked("ed-bob").unwrap());
+    }
+
+    #[test]
+    fn unblock_key_never_touches_peers() {
+        // D-A's separable-underneath property the other way: blocking/unblocking a
+        // key issues no SQL against peers at all.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.block_key("ed-bob", 1_700_000_500).unwrap();
+        store.unblock_key("ed-bob").unwrap();
+
+        assert!(store.get_peer_by_key("ed-bob").unwrap().is_some());
+    }
+
+    #[test]
+    fn list_blocked_returns_every_blocked_key() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.block_key("ed-bob", 1_700_000_000).unwrap();
+        store.block_key("ed-carol", 1_700_000_500).unwrap();
+
+        let blocked = store.list_blocked().unwrap();
+        assert_eq!(blocked.len(), 2);
+        assert_eq!(blocked[0].ed25519_pubkey, "ed-bob");
+        assert_eq!(blocked[1].ed25519_pubkey, "ed-carol");
+    }
+
+    #[test]
+    fn re_adding_a_deleted_and_blocked_peer_leaves_the_block_standing() {
+        // D-B: re-add restores the pin; the block, being independent (D-A), is
+        // untouched by either the delete or the re-add.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.block_key("ed-bob", 1_700_000_500).unwrap();
+        store.delete_peer("ed-bob").unwrap();
+        assert!(store.is_blocked("ed-bob").unwrap());
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_001_000).unwrap();
+
+        assert!(store.get_peer_by_key("ed-bob").unwrap().is_some());
+        assert!(store.is_blocked("ed-bob").unwrap());
+    }
+
+    #[test]
+    fn re_adding_a_deleted_peer_does_not_resurrect_a_purged_pending_send() {
+        // AC6/AC9 consistency: re-add restores the pin and (if blocked) leaves the
+        // block standing, but never resurrects a pending note_sends row purged by an
+        // earlier delete.
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("notes.sqlite"), &[3u8; 32]).unwrap();
+
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_000_000).unwrap();
+        store.insert_note(&sample_note("note1", "me", None)).unwrap();
+        store
+            .record_pending_sends("note1", &SendTargets::Directed(vec!["ed-bob".to_string()]))
+            .unwrap();
+
+        store.delete_peer("ed-bob").unwrap();
+        store.add_peer("bob", "ed-bob", "x-bob", 1_700_001_000).unwrap();
+
+        // The peer is back, but note1's send to them was purged on delete and must
+        // not have come back just because the peer was re-added.
         assert_eq!(store.pending_sends().unwrap().len(), 0);
     }
 }
