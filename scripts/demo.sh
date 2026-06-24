@@ -18,6 +18,13 @@
 # pinned peer or target a directed subset, with per-recipient delivery state so one
 # occupied relay slot never blocks or duplicates delivery to anyone else.
 # See docs/slices/SLICE-03.md.
+#
+# Slice 04 (receive-side consent: delete a peer, block a key): a peer can be unpinned
+# (delete), reclassifying their existing notes to Unknown without erasing anything; a
+# key can be blocked, independently of whether it's pinned, so a subsequently received
+# note from it is decrypted/verified then dropped before storage. Delete and block are
+# independently invokable, not welded together - a UI/CLI default may couple them, but
+# each is separately expressible. See docs/slices/SLICE-04.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -354,5 +361,218 @@ if ! echo "$WRONG_OUTPUT" | grep -qi "incorrect passphrase"; then
 fi
 echo "OK: wrong passphrase fails with a typed error (exit code $WRONG_STATUS), no panic"
 
+echo "==> Slice 04 setup: Kate, and five peers/strangers she'll delete/block/re-add"
+KATE_DIR="$WORKDIR/kate"
+LEO_DIR="$WORKDIR/leo"
+MIA_DIR="$WORKDIR/mia"
+NORA_DIR="$WORKDIR/nora"
+OSCAR_DIR="$WORKDIR/oscar"
+PAULA_DIR="$WORKDIR/paula"
+QUINN_DIR="$WORKDIR/quinn"
+
+printf 'kate-pass\nkate-pass\n' | "$CLI" --data-dir "$KATE_DIR" init >/dev/null
+printf 'leo-pass\nleo-pass\n' | "$CLI" --data-dir "$LEO_DIR" init >/dev/null
+printf 'mia-pass\nmia-pass\n' | "$CLI" --data-dir "$MIA_DIR" init >/dev/null
+printf 'nora-pass\nnora-pass\n' | "$CLI" --data-dir "$NORA_DIR" init >/dev/null
+printf 'oscar-pass\noscar-pass\n' | "$CLI" --data-dir "$OSCAR_DIR" init >/dev/null
+printf 'paula-pass\npaula-pass\n' | "$CLI" --data-dir "$PAULA_DIR" init >/dev/null
+printf 'quinn-pass\nquinn-pass\n' | "$CLI" --data-dir "$QUINN_DIR" init >/dev/null
+
+KATE_CARD=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" whoami)
+LEO_CARD=$(printf 'leo-pass\n' | "$CLI" --data-dir "$LEO_DIR" whoami)
+MIA_CARD=$(printf 'mia-pass\n' | "$CLI" --data-dir "$MIA_DIR" whoami)
+OSCAR_CARD=$(printf 'oscar-pass\n' | "$CLI" --data-dir "$OSCAR_DIR" whoami)
+PAULA_CARD=$(printf 'paula-pass\n' | "$CLI" --data-dir "$PAULA_DIR" whoami)
+QUINN_CARD=$(printf 'quinn-pass\n' | "$CLI" --data-dir "$QUINN_DIR" whoami)
+
+# Kate pins everyone she'll exchange with - except Nora, who stays a stranger.
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer leo "$LEO_CARD" >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer mia "$MIA_CARD" >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer oscar "$OSCAR_CARD" >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer paula "$PAULA_CARD" >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer quinn "$QUINN_CARD" >/dev/null
+
+# Everyone who will address Kate pins her back, including Nora the stranger - it's
+# Kate who never pins Nora, which is what makes Nora's case the unpinned one.
+printf 'leo-pass\n' | "$CLI" --data-dir "$LEO_DIR" add-peer kate "$KATE_CARD" >/dev/null
+printf 'mia-pass\n' | "$CLI" --data-dir "$MIA_DIR" add-peer kate "$KATE_CARD" >/dev/null
+printf 'nora-pass\n' | "$CLI" --data-dir "$NORA_DIR" add-peer kate "$KATE_CARD" >/dev/null
+printf 'oscar-pass\n' | "$CLI" --data-dir "$OSCAR_DIR" add-peer kate "$KATE_CARD" >/dev/null
+printf 'paula-pass\n' | "$CLI" --data-dir "$PAULA_DIR" add-peer kate "$KATE_CARD" >/dev/null
+
+echo "==> Slice 04: deleting Leo (kept unblocked) reclassifies his note Unknown; re-adding repaints it Known (AC1/AC2)"
+LEO_BODY="leo's first note to kate - $(date +%s)"
+printf 'leo-pass\n' | "$CLI" --data-dir "$LEO_DIR" post "$LEO_BODY" --to kate >/dev/null
+printf 'leo-pass\n' | "$CLI" --data-dir "$LEO_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+
+KATE_LIST=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list)
+if ! echo "$KATE_LIST" | grep -qF "$LEO_BODY" || ! echo "$KATE_LIST" | grep -q "leo ("; then
+    echo "FAIL: expected Leo's note stored and classified Known before delete"
+    exit 1
+fi
+
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" delete-peer leo --keep-unblocked >/dev/null
+KATE_LIST=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list)
+if ! echo "$KATE_LIST" | grep -qF "$LEO_BODY" || ! echo "$KATE_LIST" | grep -qi "unknown sender"; then
+    echo "FAIL: expected Leo's existing note to reclassify Unknown after delete - nothing should be erased"
+    exit 1
+fi
+echo "OK: deleting Leo reclassified his stored note to Unknown, nothing erased from notes (AC1)"
+
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer leo "$LEO_CARD" >/dev/null
+KATE_LIST=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list)
+if ! echo "$KATE_LIST" | grep -qF "$LEO_BODY" || ! echo "$KATE_LIST" | grep -q "leo ("; then
+    echo "FAIL: expected re-adding Leo to repaint his note back to Known in one stroke"
+    exit 1
+fi
+echo "OK: re-adding Leo repainted his existing note back to Known, no per-note action (AC2)"
+
+echo "==> Slice 04: deleting Oscar without blocking - his next note still arrives, unpinned but not dropped (AC5)"
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" delete-peer oscar --keep-unblocked >/dev/null
+OSCAR_BODY="oscar's note after being deleted but not blocked - $(date +%s)"
+printf 'oscar-pass\n' | "$CLI" --data-dir "$OSCAR_DIR" post "$OSCAR_BODY" --to kate >/dev/null
+printf 'oscar-pass\n' | "$CLI" --data-dir "$OSCAR_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+KATE_SYNC=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$KATE_SYNC" | grep -qF "$OSCAR_BODY"; then
+    echo "FAIL: a deleted-but-unblocked sender's fresh note must still arrive, got: $KATE_SYNC"
+    exit 1
+fi
+if ! printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list | grep -qi "unknown sender"; then
+    echo "FAIL: Oscar's note should classify Unknown - he's unpinned, just not blocked"
+    exit 1
+fi
+echo "OK: delete-without-block let Oscar's fresh note arrive normally (Unknown, not dropped) - delete and block stayed independent (AC5)"
+
+echo "==> Slice 04: blocking Mia (still pinned) drops her next note before storage, without unpinning her (AC3/AC5)"
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" block mia >/dev/null
+BLOCKED_BODY="mia's note while blocked - $(date +%s)"
+printf 'mia-pass\n' | "$CLI" --data-dir "$MIA_DIR" post "$BLOCKED_BODY" --to kate >/dev/null
+printf 'mia-pass\n' | "$CLI" --data-dir "$MIA_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+KATE_SYNC=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$KATE_SYNC" | grep -qi "dropped a note from a blocked sender"; then
+    echo "FAIL: expected Kate to drop Mia's note while blocked, got: $KATE_SYNC"
+    exit 1
+fi
+if printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list | grep -qF "$BLOCKED_BODY"; then
+    echo "FAIL: a dropped note must never be stored or listed"
+    exit 1
+fi
+if ! printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-peers | grep -q '^mia ('; then
+    echo "FAIL: blocking must not have unpinned Mia - she should still be pinned"
+    exit 1
+fi
+echo "OK: Mia's note was decrypted/verified then dropped, never stored - her pin and Known classification untouched (AC3/AC5)"
+
+echo "==> Slice 04: Kate's relay slot was freed by the pull despite the drop - Mia's next push succeeds immediately"
+SECOND_BLOCKED_BODY="mia's second note, still blocked - $(date +%s)"
+printf 'mia-pass\n' | "$CLI" --data-dir "$MIA_DIR" post "$SECOND_BLOCKED_BODY" --to kate >/dev/null
+PUSH_OUTPUT=$(printf 'mia-pass\n' | "$CLI" --data-dir "$MIA_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$PUSH_OUTPUT" | grep -qi "handed note .* to the relay for kate"; then
+    echo "FAIL: expected Mia's push to Kate's routing key to succeed immediately - it should have been freed by the earlier drop, not left occupied"
+    exit 1
+fi
+echo "OK: the relay slot was free - the drop happens client-side, after pulling, never holding the relay slot hostage (AC3)"
+
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" unblock mia >/dev/null
+KATE_SYNC=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$KATE_SYNC" | grep -qF "$SECOND_BLOCKED_BODY"; then
+    echo "FAIL: expected Mia's note to arrive normally after unblocking, got: $KATE_SYNC"
+    exit 1
+fi
+echo "OK: unblocking let a subsequently received note through - block specifically gated the dropped one, not a general failure (AC4)"
+
+echo "==> Slice 04: blocking an unknown sender, end to end - list prints the key, block uses it, the next note drops (D-E, AC3)"
+NORA_BODY="nora's note - a stranger kate never pins - $(date +%s)"
+printf 'nora-pass\n' | "$CLI" --data-dir "$NORA_DIR" post "$NORA_BODY" --to kate >/dev/null
+printf 'nora-pass\n' | "$CLI" --data-dir "$NORA_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+
+KATE_LIST=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list)
+if ! echo "$KATE_LIST" | grep -qF "$NORA_BODY" || ! echo "$KATE_LIST" | grep -qi "unknown sender"; then
+    echo "FAIL: expected Nora's note to arrive and show as unknown sender"
+    exit 1
+fi
+# The full hex key is list's trailing field (D-E) - the only way to name a
+# never-pinned sender precisely enough to block them; a fingerprint cannot be
+# reversed back into one.
+NORA_KEY=$(echo "$KATE_LIST" | grep -F "$NORA_BODY" | awk '{print $NF}')
+if [ "${#NORA_KEY}" -ne 64 ]; then
+    echo "FAIL: expected list to print Nora's full 64-hex author key as the trailing field, got: $NORA_KEY"
+    exit 1
+fi
+
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" block "$NORA_KEY" >/dev/null
+NORA_BODY2="nora's second note, after kate blocks her by key - $(date +%s)"
+printf 'nora-pass\n' | "$CLI" --data-dir "$NORA_DIR" post "$NORA_BODY2" --to kate >/dev/null
+printf 'nora-pass\n' | "$CLI" --data-dir "$NORA_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+KATE_SYNC=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$KATE_SYNC" | grep -qi "dropped a note from a blocked sender"; then
+    echo "FAIL: expected Nora's second note to be dropped after blocking her by her printed key, got: $KATE_SYNC"
+    exit 1
+fi
+if printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list | grep -qF "$NORA_BODY2"; then
+    echo "FAIL: a dropped note must never be stored"
+    exit 1
+fi
+echo "OK: blocked a never-pinned stranger by the exact key list printed - list, copy, block, drop, end to end (D-E, AC3)"
+
+echo "==> Slice 04: deleting (default, coupled) and re-adding Paula leaves the block standing - the re-add path says so (D-B, AC6)"
+# Deliberately not stripped of spaces (unlike EVE_FINGERPRINT above): list-blocked
+# prints the same space-grouped format_fingerprint output, so the literal substring
+# (spaces included) is what must match there.
+PAULA_FINGERPRINT=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-peers \
+    | grep '^paula (' | sed -E 's/^paula \(([^)]*)\)$/\1/')
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" delete-peer paula >/dev/null
+if ! printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-blocked | grep -qF "$PAULA_FINGERPRINT"; then
+    echo "FAIL: expected Paula's key to be blocked by the default coupled delete"
+    exit 1
+fi
+
+READD_OUTPUT=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer paula "$PAULA_CARD")
+if ! echo "$READD_OUTPUT" | grep -qi "still blocked"; then
+    echo "FAIL: expected the re-add path to surface the D-B notice, got: $READD_OUTPUT"
+    exit 1
+fi
+
+PAULA_BODY="paula's note after being re-added but still blocked - $(date +%s)"
+printf 'paula-pass\n' | "$CLI" --data-dir "$PAULA_DIR" post "$PAULA_BODY" --to kate >/dev/null
+printf 'paula-pass\n' | "$CLI" --data-dir "$PAULA_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+KATE_SYNC=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR")
+if ! echo "$KATE_SYNC" | grep -qi "dropped a note from a blocked sender"; then
+    echo "FAIL: expected a note from re-added-but-still-blocked Paula to still be dropped, got: $KATE_SYNC"
+    exit 1
+fi
+echo "OK: re-adding Paula restored her pin but left the block standing - the re-add path warned, her mail still drops (D-B, AC6)"
+
+echo "==> Slice 04: deleting Quinn purges her not-yet-pushed pending send; re-adding does not resurrect it (AC9)"
+PENDING_BODY="kate's note addressed to quinn, never pushed before delete - $(date +%s)"
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" post "$PENDING_BODY" --to quinn >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" delete-peer quinn >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer quinn "$QUINN_CARD" >/dev/null
+PUSH_AFTER_READD=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR")
+if echo "$PUSH_AFTER_READD" | grep -qi "quinn"; then
+    echo "FAIL: re-adding quinn must not resurrect the pending send purged by delete, got: $PUSH_AFTER_READD"
+    exit 1
+fi
+printf 'quinn-pass\n' | "$CLI" --data-dir "$QUINN_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+if printf 'quinn-pass\n' | "$CLI" --data-dir "$QUINN_DIR" list | grep -qF "$PENDING_BODY"; then
+    echo "FAIL: quinn must never receive a note whose pending send was purged before any push"
+    exit 1
+fi
+echo "OK: delete purged the not-yet-pushed send; re-adding quinn did not resurrect or push it (AC9)"
+
+echo "==> Slice 04: add-peer refuses to pin one's own card (AC7)"
+SELF_OUTPUT=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer myself "$KATE_CARD")
+if ! echo "$SELF_OUTPUT" | grep -qi "refusing to pin yourself"; then
+    echo "FAIL: expected add-peer to refuse pinning kate's own card, got: $SELF_OUTPUT"
+    exit 1
+fi
+if printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-peers | grep -q '^myself ('; then
+    echo "FAIL: self-add must write nothing"
+    exit 1
+fi
+echo "OK: add-peer refused to pin Kate's own card, nothing written (AC7)"
+
 echo
-echo "All Slice 01, Slice 02, and Slice 03 acceptance criteria demonstrated successfully."
+echo "All Slice 01, Slice 02, Slice 03, and Slice 04 acceptance criteria demonstrated successfully."
