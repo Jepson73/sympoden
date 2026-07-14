@@ -520,6 +520,8 @@ j. **A card's X25519 half is trusted on import, unverified against its Ed25519 h
    pin in any draft). The fix — self-signing the card so substitution fails verification
    at import — is named in NON-GOALS as a dedicated future hardening slice, not
    something this rework happens to provide as a side effect.
+   **Closed by SLICE-05.md**: a card's Ed25519 key now signs its paired X25519 key,
+   verified at `add_peer` before anything is written, first pin included.
 
 ## Zero-diff set
 
