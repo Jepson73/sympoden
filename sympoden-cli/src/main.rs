@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use sympoden_engine::content::Note;
-use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError};
-use sympoden_engine::identity::{Identity, PublicCard, fingerprint_hex, format_fingerprint};
+use sympoden_engine::error::{CardError, ContentError, IdentityError, StoreError, SyncError};
+use sympoden_engine::identity::{
+    Identity, PublicCard, SignedCard, check_card_against_pin, fingerprint_hex, format_fingerprint,
+};
 use sympoden_engine::store::{AddPeerOutcome, PinnedPeer, SendTargets, Store, resolve_peer_query};
 use sympoden_engine::sync::{self, RelayClient};
 use sympoden_engine::trust::{self, AuthorTrust};
@@ -112,8 +112,8 @@ enum CliError {
     Content(#[from] ContentError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid peer card: {0}")]
-    InvalidCard(String),
+    #[error(transparent)]
+    Card(#[from] CardError),
     #[error("passphrases did not match")]
     PassphraseMismatch,
     #[error("\"{label}\" is already pinned to a different peer - refusing under --strict")]
@@ -207,10 +207,7 @@ fn cmd_init(dir: &Path) -> Result<(), CliError> {
 
 fn cmd_whoami(dir: &Path) -> Result<(), CliError> {
     let identity = unlock(dir)?;
-    let card = identity.public_card();
-    let encoded =
-        BASE64.encode(serde_json::to_vec(&card).map_err(|e| CliError::InvalidCard(e.to_string()))?);
-    println!("{encoded}");
+    println!("{}", identity.card_encoded());
     Ok(())
 }
 
@@ -252,15 +249,19 @@ fn cmd_add_peer(dir: &Path, label: &str, card: &str, strict: bool) -> Result<(),
     let identity = unlock(dir)?;
     let store = Store::open(&db_path(dir), &identity.db_key)?;
 
-    let decoded = BASE64
-        .decode(card.trim())
-        .map_err(|e| CliError::InvalidCard(e.to_string()))?;
-    let parsed: PublicCard =
-        serde_json::from_slice(&decoded).map_err(|e| CliError::InvalidCard(e.to_string()))?;
+    // SignedCard::parse_and_verify (SLICE-05.md D-D) is the only way card bytes ever
+    // turn into trusted keys - base64 decode, structural checks, then signature
+    // verification, all before anything below sees the card.
+    let verified = SignedCard::parse_and_verify(card.trim())?;
+    let ed25519_pubkey = hex::encode(verified.ed25519_pubkey.as_bytes());
+    let x25519_pubkey = hex::encode(verified.x25519_pubkey.to_bytes());
 
-    // Validate the card actually parses into real keys before pinning it.
-    let ed25519_pubkey = hex::encode(parsed.ed25519_verifying_key()?.as_bytes());
-    let x25519_pubkey = hex::encode(parsed.x25519_public_key()?.to_bytes());
+    // D-C: if this Ed25519 key is already pinned, its X25519 key must match the one
+    // this card offers - a validly-signed card claiming a different X25519 key for an
+    // already-pinned identity is rejected loudly, before add_peer is ever reached.
+    if let Some(existing) = store.get_peer_by_key(&ed25519_pubkey)? {
+        check_card_against_pin(&verified, &existing)?;
+    }
 
     // Self-add rejection (SLICE-04.md D-D): a call-site guard, not an engine check -
     // Store stays identity-free. Rejected before check_label_collision or add_peer is
