@@ -22,8 +22,10 @@ use tauri::{Manager, State};
 use thiserror::Error;
 
 use sympoden_engine::content::Note;
-use sympoden_engine::error::{ContentError, IdentityError, StoreError, SyncError};
-use sympoden_engine::identity::{Identity, PublicCard, fingerprint_hex, format_fingerprint};
+use sympoden_engine::error::{CardError, ContentError, IdentityError, StoreError, SyncError};
+use sympoden_engine::identity::{
+    Identity, PublicCard, SignedCard, check_card_against_pin, fingerprint_hex, format_fingerprint,
+};
 use sympoden_engine::store::{AddPeerOutcome, BlockedKey, PinnedPeer, SendTargets, Store};
 use sympoden_engine::sync::{self, RelayClient};
 use sympoden_engine::trust::{self, TrustedNote};
@@ -62,8 +64,8 @@ enum AppError {
     Content(#[from] ContentError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid peer card: {0}")]
-    InvalidCard(String),
+    #[error(transparent)]
+    Card(#[from] CardError),
     #[error("not unlocked")]
     NotUnlocked,
 }
@@ -191,8 +193,8 @@ fn unlock_identity_session(dir: &Path, passphrase: &str) -> Result<Session, AppE
     Ok(Session { identity, store })
 }
 
-fn whoami_card(session: &Session) -> PublicCard {
-    session.identity.public_card()
+fn whoami_card(session: &Session) -> String {
+    session.identity.card_encoded()
 }
 
 /// Pin a peer's card under `label`. Key-as-identity (SLICE-03.md D1-D3): if the card's
@@ -207,12 +209,20 @@ fn add_peer_card(
     card: &str,
     confirm_collision: bool,
 ) -> Result<AddPeerResult, AppError> {
-    let parsed: PublicCard =
-        serde_json::from_str(card).map_err(|e| AppError::InvalidCard(e.to_string()))?;
+    // SignedCard::parse_and_verify (SLICE-05.md D-D) is the only way card bytes ever
+    // turn into trusted keys - base64 decode, structural checks, then signature
+    // verification, all before anything below sees the card. `card` is raw base64
+    // text now (D-E(2)) - the frontend no longer decodes it first.
+    let verified = SignedCard::parse_and_verify(card)?;
+    let ed25519_pubkey = hex::encode(verified.ed25519_pubkey.as_bytes());
+    let x25519_pubkey = hex::encode(verified.x25519_pubkey.to_bytes());
 
-    // Validate the card actually parses into real keys before pinning it.
-    let ed25519_pubkey = hex::encode(parsed.ed25519_verifying_key()?.as_bytes());
-    let x25519_pubkey = hex::encode(parsed.x25519_public_key()?.to_bytes());
+    // D-C: if this Ed25519 key is already pinned, its X25519 key must match the one
+    // this card offers - a validly-signed card claiming a different X25519 key for an
+    // already-pinned identity is rejected loudly, before add_peer is ever reached.
+    if let Some(existing) = session.store.get_peer_by_key(&ed25519_pubkey)? {
+        check_card_against_pin(&verified, &existing)?;
+    }
 
     // Self-add rejection (SLICE-04.md D-D): a call-site guard, not an engine check -
     // Store stays identity-free. Rejected before check_label_collision or add_peer is
@@ -447,7 +457,7 @@ fn whoami(state: State<AppState>) -> Result<String, String> {
         .lock()
         .map_err(|_| "internal error".to_string())?;
     let session = guard.as_ref().ok_or_else(|| AppError::NotUnlocked.to_string())?;
-    serde_json::to_string(&whoami_card(session)).map_err(|e| e.to_string())
+    Ok(whoami_card(session))
 }
 
 #[tauri::command]
@@ -647,13 +657,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "correct horse battery staple").unwrap();
 
-        // whoami -> PublicCard (serialized to a String by the command wrapper): only
-        // the two public keys, nothing else.
-        let card_json = serde_json::to_value(whoami_card(&session)).unwrap();
+        // whoami -> a ready-to-paste base64 string (SLICE-05.md D-E(2)): decode it back
+        // to the SignedCard JSON it wraps and confirm only public, non-secret fields
+        // are present - the two public keys, the version, and a signature over them
+        // (a signature is not secret; only the private key that produced it is).
+        use base64::Engine as _;
+        let card_bytes = base64::engine::general_purpose::STANDARD
+            .decode(whoami_card(&session).trim())
+            .unwrap();
+        let card_json: serde_json::Value = serde_json::from_slice(&card_bytes).unwrap();
         let card_obj = card_json.as_object().unwrap();
         let card_keys: std::collections::BTreeSet<String> = card_obj.keys().cloned().collect();
         let expected_card_keys: std::collections::BTreeSet<String> =
-            ["ed25519_public", "x25519_public"]
+            ["version", "ed25519_public", "x25519_public", "signature"]
                 .into_iter()
                 .map(String::from)
                 .collect();
@@ -755,7 +771,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "passphrase").unwrap();
         let result = add_peer_card(&session, "bob", "not json at all", false);
-        assert!(matches!(result, Err(AppError::InvalidCard(_))));
+        assert!(matches!(
+            result,
+            Err(AppError::Card(CardError::NotBase64(_)))
+        ));
     }
 
     #[test]
@@ -769,8 +788,8 @@ mod tests {
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
         let carol = create_identity_session(&carol_dir, "carol-pass").unwrap();
 
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
-        let carol_card = serde_json::to_string(&whoami_card(&carol)).unwrap();
+        let bob_card = whoami_card(&bob);
+        let carol_card = whoami_card(&carol);
 
         let first = add_peer_card(&session, "bob", &bob_card, false).unwrap();
         assert!(matches!(
@@ -804,8 +823,8 @@ mod tests {
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
         let eve = create_identity_session(&eve_dir, "eve-pass").unwrap();
 
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
-        let eve_card = serde_json::to_string(&whoami_card(&eve)).unwrap();
+        let bob_card = whoami_card(&bob);
+        let eve_card = whoami_card(&eve);
         add_peer_card(&session, "bob", &bob_card, false).unwrap();
 
         // A different key under the same label, without confirmation: nothing is
@@ -840,7 +859,7 @@ mod tests {
         let bob_dir = dir.path().join("bob");
         fs::create_dir_all(&bob_dir).unwrap();
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let bob_card = whoami_card(&bob);
 
         add_peer_card(&session, "bob", &bob_card, false).unwrap();
         let result = add_peer_card(&session, "robert", &bob_card, false).unwrap();
@@ -875,7 +894,7 @@ mod tests {
         let bob_dir = dir.path().join("bob");
         fs::create_dir_all(&bob_dir).unwrap();
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let bob_card = whoami_card(&bob);
         add_peer_card(&session, "bob", &bob_card, false).unwrap();
         let original_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
         assert_eq!(original_key.len(), 64, "sanity check: a raw hex Ed25519 key, not a label or fingerprint");
@@ -1055,13 +1074,13 @@ mod tests {
         let alice = create_identity_session(&alice_dir, "alice-pass").unwrap();
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
 
-        let bob_card_json = serde_json::to_string(&whoami_card(&bob)).unwrap();
-        add_peer_card(&alice, "bob", &bob_card_json, false).unwrap();
+        let bob_card = whoami_card(&bob);
+        add_peer_card(&alice, "bob", &bob_card, false).unwrap();
         // Bob also pins Alice, so the note that flows (Alice -> Bob) classifies as
         // Known on Bob's side, not Unknown - without this, the test would never
         // exercise SLICE-02's actual headline property.
-        let alice_card_json = serde_json::to_string(&whoami_card(&alice)).unwrap();
-        add_peer_card(&bob, "alice", &alice_card_json, false).unwrap();
+        let alice_card = whoami_card(&alice);
+        add_peer_card(&bob, "alice", &alice_card, false).unwrap();
 
         let body = "hello bob, from a headless two-session test".to_string();
         post_note_now(&alice, body.clone(), 1_700_000_000, None).unwrap();
@@ -1105,8 +1124,8 @@ mod tests {
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
         let carol = create_identity_session(&carol_dir, "carol-pass").unwrap();
 
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
-        let carol_card = serde_json::to_string(&whoami_card(&carol)).unwrap();
+        let bob_card = whoami_card(&bob);
+        let carol_card = whoami_card(&carol);
         add_peer_card(&alice, "bob", &bob_card, false).unwrap();
         add_peer_card(&alice, "carol", &carol_card, false).unwrap();
         let bob_key = list_peers_inner(&alice)
@@ -1135,7 +1154,7 @@ mod tests {
     fn add_peer_card_rejects_pinning_ones_own_whoami_card() {
         let dir = tempdir().unwrap();
         let session = create_identity_session(dir.path(), "passphrase").unwrap();
-        let own_card = serde_json::to_string(&whoami_card(&session)).unwrap();
+        let own_card = whoami_card(&session);
 
         let result = add_peer_card(&session, "myself", &own_card, false).unwrap();
 
@@ -1150,7 +1169,7 @@ mod tests {
         let bob_dir = dir.path().join("bob");
         fs::create_dir_all(&bob_dir).unwrap();
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let bob_card = whoami_card(&bob);
         add_peer_card(&session, "bob", &bob_card, false).unwrap();
         let bob_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
 
@@ -1191,7 +1210,7 @@ mod tests {
         let bob_dir = dir.path().join("bob");
         fs::create_dir_all(&bob_dir).unwrap();
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let bob_card = whoami_card(&bob);
         add_peer_card(&session, "bob", &bob_card, false).unwrap();
         let bob_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
 
@@ -1230,7 +1249,7 @@ mod tests {
         let bob_dir = dir.path().join("bob");
         fs::create_dir_all(&bob_dir).unwrap();
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
-        let bob_card = serde_json::to_string(&whoami_card(&bob)).unwrap();
+        let bob_card = whoami_card(&bob);
         add_peer_card(&session, "bob", &bob_card, false).unwrap();
         let bob_key = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
 
@@ -1257,10 +1276,10 @@ mod tests {
         let alice = create_identity_session(&alice_dir, "alice-pass").unwrap();
         let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
 
-        let bob_card_json = serde_json::to_string(&whoami_card(&bob)).unwrap();
-        add_peer_card(&alice, "bob", &bob_card_json, false).unwrap();
-        let alice_card_json = serde_json::to_string(&whoami_card(&alice)).unwrap();
-        add_peer_card(&bob, "alice", &alice_card_json, false).unwrap();
+        let bob_card = whoami_card(&bob);
+        add_peer_card(&alice, "bob", &bob_card, false).unwrap();
+        let alice_card = whoami_card(&alice);
+        add_peer_card(&bob, "alice", &alice_card, false).unwrap();
 
         post_note_now(&alice, "hello bob".to_string(), 1_700_000_000, None).unwrap();
         let relay_addr = start_test_relay();
@@ -1289,5 +1308,163 @@ mod tests {
         let blocked = list_blocked_inner(&session).unwrap();
         assert_eq!(blocked.len(), 1);
         assert_eq!(blocked[0].ed25519_pubkey, "ed-carol");
+    }
+
+    // -- Slice 05: self-signed peer cards (bind X25519 to Ed25519) --
+
+    /// Decode a `card_encoded()`/`whoami_card()` string back into its `SignedCard`
+    /// JSON `Value`, tamper one field, and re-encode - the same shape a corrupted or
+    /// forged card would have.
+    fn tamper_card(card_base64: &str, field: &str, value: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(card_base64.trim())
+            .unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json[field] = value;
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&json).unwrap())
+    }
+
+    /// Decode a card's `x25519_public` field as a bare string, without needing to name
+    /// any x25519-dalek type in this crate.
+    fn card_x25519_public_field(card_base64: &str) -> String {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(card_base64.trim())
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["x25519_public"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn add_peer_rejects_a_card_with_a_tampered_x25519_key() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+        let eve_dir = dir.path().join("eve");
+        fs::create_dir_all(&eve_dir).unwrap();
+        let eve = create_identity_session(&eve_dir, "eve-pass").unwrap();
+
+        let bob_card = whoami_card(&bob);
+        let eve_x25519 = card_x25519_public_field(&whoami_card(&eve));
+        let tampered = tamper_card(
+            &bob_card,
+            "x25519_public",
+            serde_json::Value::String(eve_x25519),
+        );
+
+        let result = add_peer_card(&session, "bob", &tampered, false);
+        assert!(matches!(
+            result,
+            Err(AppError::Card(CardError::SignatureInvalid))
+        ));
+        assert_eq!(list_peers_inner(&session).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn add_peer_rejects_a_card_with_a_tampered_signature() {
+        use base64::Engine as _;
+
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+
+        let bob_card = whoami_card(&bob);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(bob_card.trim())
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(json["signature"].as_str().unwrap())
+            .unwrap();
+        sig_bytes[0] ^= 0xFF;
+        let tampered = tamper_card(
+            &bob_card,
+            "signature",
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(sig_bytes)),
+        );
+
+        let result = add_peer_card(&session, "bob", &tampered, false);
+        assert!(matches!(
+            result,
+            Err(AppError::Card(CardError::SignatureInvalid))
+        ));
+        assert_eq!(list_peers_inner(&session).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn add_peer_rejects_a_legacy_unsigned_card_with_a_friendly_message() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+
+        // Today's pre-Slice-05 shape: only the two bare keys, no version/signature -
+        // `Identity::public_card` (kept for sync.rs's tests, SLICE-05.md's deviation
+        // note) produces exactly this shape.
+        use base64::Engine as _;
+        let legacy = bob.identity.public_card();
+        let legacy_card = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&legacy).unwrap());
+
+        let result = add_peer_card(&session, "bob", &legacy_card, false);
+        assert!(matches!(
+            result,
+            Err(AppError::Card(CardError::LegacyUnsigned))
+        ));
+    }
+
+    #[test]
+    fn add_peer_rejects_a_conflicting_x25519_key_for_an_already_pinned_peer() {
+        let dir = tempdir().unwrap();
+        let session = create_identity_session(dir.path(), "passphrase").unwrap();
+        let bob_dir = dir.path().join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let bob = create_identity_session(&bob_dir, "bob-pass").unwrap();
+
+        let bob_card = whoami_card(&bob);
+        add_peer_card(&session, "bob", &bob_card, false).unwrap();
+        let pinned_x25519_before = list_peers_inner(&session).unwrap()[0].ed25519_pubkey.clone();
+
+        // A validly-signed card for Bob's Ed25519 key but a *different* X25519 key -
+        // not a tamper (the signature verifies fine), a genuine claim of a new key.
+        // Constructed by reusing Bob's real signing key with an unrelated identity's
+        // freshly generated X25519 secret and calling the real `card_encoded()` on it
+        // - the same composition production code uses, no duplicated crypto in the
+        // test, and no need to name any x25519-dalek type in this crate (the fresh
+        // secret is *moved* out of a throwaway `Identity::create`d session).
+        let bob2_dir = dir.path().join("bob2");
+        fs::create_dir_all(&bob2_dir).unwrap();
+        let bob_new_keys = create_identity_session(&bob2_dir, "bob2-pass").unwrap();
+        let bob_new_x25519_identity = Identity {
+            signing_key: bob.identity.signing_key.clone(),
+            x25519_secret: bob_new_keys.identity.x25519_secret,
+            db_key: bob.identity.db_key.clone(),
+        };
+        let conflicting_card = bob_new_x25519_identity.card_encoded();
+
+        let result = add_peer_card(&session, "bob", &conflicting_card, false);
+        match result {
+            Err(AppError::Card(CardError::PinnedKeyConflict {
+                label,
+                ed25519_fingerprint,
+                existing_x25519_display,
+                offered_x25519_display,
+            })) => {
+                assert_eq!(label, "bob");
+                assert!(!ed25519_fingerprint.is_empty());
+                assert_ne!(existing_x25519_display, offered_x25519_display);
+            }
+            other => panic!("expected PinnedKeyConflict, got {other:?}"),
+        }
+        // The pin's stored X25519 key is left untouched.
+        let peers = list_peers_inner(&session).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].ed25519_pubkey, pinned_x25519_before);
     }
 }
