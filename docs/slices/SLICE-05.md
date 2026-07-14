@@ -571,15 +571,16 @@ replacing their `InvalidCard(String)` variant.
 
 **Tests / demo:**
 - Engine unit tests (identity.rs): a freshly signed card verifies; tampering the
-  X25519 field after signing fails verification; tampering the `version` byte after
-  signing fails verification (proves the version is under the signature, not just
-  gated by the pre-check at step 5); tampering the signature bytes fails verification;
-  a hand-built legacy-shaped JSON (no `version`) yields `LegacyUnsigned`; a `version: 3`
-  card yields `UnsupportedVersion(3)`; garbage base64/JSON yields `NotBase64`/`NotJson`;
-  a card round-trips through `card_encoded()` → `parse_and_verify()` back to the same
-  two keys; `check_card_against_pin` returns `Ok` for a matching X25519 key and
-  `Err(PinnedKeyConflict { .. })` with the three specified display fields for a
-  mismatched one.
+  X25519 field after signing fails verification (`SignatureInvalid`); a direct
+  `card_canonical_bytes`/`crypto::verify` test proves the version byte is inside the
+  signed bytes (AC3 — signing over version 2, verifying the same signature against
+  version 3's canonical bytes, must fail); tampering the signature bytes fails
+  verification; a hand-built legacy-shaped JSON (no `version`) yields `LegacyUnsigned`;
+  a `version: 3` card yields `UnsupportedVersion(3)`; garbage base64/JSON yields
+  `NotBase64`/`NotJson`; a card round-trips through `card_encoded()` →
+  `parse_and_verify()` back to the same two keys; `check_card_against_pin` returns `Ok`
+  for a matching X25519 key and `Err(PinnedKeyConflict { .. })` with the three
+  specified display fields for a mismatched one.
 - CLI/app tests: the D-C conflict case (pin a key, then feed a validly-signed card for
   the same Ed25519 key but a different X25519 key — rejected via
   `CardError::PinnedKeyConflict`, message naming the peer's label, its one shared
@@ -601,11 +602,17 @@ replacing their `InvalidCard(String)` variant.
 2. A card whose `x25519_public` field is altered after signing (so it no longer
    matches what was signed) is rejected at parse time (`CardError::SignatureInvalid`)
    before `add_peer` is ever called; nothing is written.
-3. A card whose `version` field is altered after signing to another *known* version
-   value (edited in place, signature untouched) is also rejected at parse time
-   (`CardError::SignatureInvalid`, not silently accepted as the edited version) —
-   proves the version byte is genuinely inside the signed bytes (D-A's crux), not
-   merely gated by the separate version check at gate 5.
+3. The version byte is genuinely part of the signed bytes, not merely gated by the
+   separate version check at gate 5 — proved directly against `card_canonical_bytes`/
+   `crypto::verify` (sign over `canonical_bytes(2, ed, x)`, then verify the same
+   signature against `canonical_bytes(3, ed, x)`: must fail). **Not** provable end to
+   end through `SignedCard::parse_and_verify` itself with only one supported version
+   defined: gate 5 (`card.version != CARD_VERSION`) runs before gate 8 and intercepts
+   *any* edited version — known or not — as `CardError::UnsupportedVersion` before
+   `crypto::verify` is ever reached, by the gate-order property AC6 already states.
+   That is correct behavior, not a gap: it means a version-tampered card is always
+   caught, just under a different (also-correct) error variant than a same-version,
+   different-key tamper would produce.
 4. A card whose `signature` field is altered/corrupted (keys untouched) is rejected
    the same way (`SignatureInvalid`).
 5. A card missing `version`/`signature` entirely (today's legacy shape, or an old
