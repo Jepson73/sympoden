@@ -708,4 +708,41 @@ call-site guard to the engine-shared `check_card_against_pin`, with the message 
 specified exactly (one shared Ed25519 fingerprint, two X25519 fingerprints); D-D's gate
 order restated as a testable property ("no signature verification runs on a card that
 fails structural checks"); D-E's card-generation-is-engine-shared point made explicit.
-No code has been written yet — implementation begins from this revision.
+
+**Code-complete and headless-verified.** `cargo test --workspace` (128 tests: 27 app,
+93 engine, 8 relay, 0 cli-unit) and `cargo clippy --workspace --all-targets -- -D
+warnings` are clean; `cargo build -p sympoden-app` succeeds; the extended
+`scripts/demo.sh` demonstrates AC1, AC2, AC4, AC5, and the D-C case (AC7) end to end
+against a live relay — a fresh v2 card pinning normally, a tampered-X25519 card and a
+tampered-signature card each rejected before pinning, a legacy-shaped card rejected
+with the friendly message, and a validly-signed conflicting-X25519 card for an
+already-pinned identity rejected loudly with the pin proven untouched. AC3 (the
+version-byte-is-signed property) and AC6 (`UnsupportedVersion`'s gate-order placement)
+are `cargo test`-only, per AC3's own corrected scoping above. `git diff
+bd68d83..HEAD -- sympoden-engine/src/crypto.rs sympoden-engine/src/content.rs
+sympoden-engine/src/sync.rs sympoden-engine/src/trust.rs sympoden-engine/src/store.rs
+sympoden-relay/` is empty.
+
+**Deviations from this document, found during implementation:**
+- `Identity::public_card()` was **not** removed, contrary to D-A's stated plan.
+  `sync.rs`'s own test module (`sync.rs:164`/`sync.rs:205`, not covered by
+  SLICE-05.md's "current card format" survey) constructs a `PublicCard` through it;
+  removing it would force editing `sync.rs` to keep it compiling, which the zero-diff
+  mandate forbids. It is otherwise dead in production — the CLI and app both call
+  `card_encoded()` exclusively from this slice on.
+- D-C's `check_card_against_pin` takes `&VerifiedCard`, not `&SignedCard` as the
+  ruling's sketch named it — the typed output `parse_and_verify` already produced, so
+  the function isn't re-decoding base64 it just decoded. Same placement, purity, and
+  call-site contract; only the parameter type differs.
+- The D-C case in `scripts/demo.sh` needed a new test-fixture-only binary
+  (`sympoden-engine/examples/mint_conflicting_card.rs`, not a CLI subcommand, not part
+  of any shipped surface): a *validly signed* conflicting-X25519 card can only be
+  produced with the real Ed25519 private key, which `sympoden-cli` deliberately
+  exposes no command for (rotation stays a non-goal). Pure byte-tampering (used for the
+  other demo.sh cases) only ever produces `SignatureInvalid`, never this case.
+
+**Not yet done:** GUI walkthrough (this slice's engine/CLI/app-unit-test surface is
+code-complete and headless-verified, but the app's UI itself — pasting a tampered or
+legacy card into the "add peer" field, reading the rejection message — has not been
+manually exercised against a live Tauri instance). No push, no tag, per this slice's
+terms.
