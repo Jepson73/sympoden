@@ -241,7 +241,7 @@ async function enterApp() {
   unlockSection.classList.add("hidden");
   appSection.classList.remove("hidden");
   const card = await invoke("whoami");
-  myCardEl.value = btoa(card);
+  myCardEl.value = card;
   await refreshPeers(); // also refreshes notes, at its end
   await refreshBlocked();
 }
@@ -299,8 +299,7 @@ async function doAddPeer(label, card, confirmCollision) {
 
 addPeerBtn.addEventListener("click", async () => {
   try {
-    const decoded = atob(peerCardInput.value.trim());
-    await doAddPeer(peerLabelInput.value.trim(), decoded, false);
+    await doAddPeer(peerLabelInput.value.trim(), peerCardInput.value.trim(), false);
   } catch (err) {
     showStatus(String(err), true);
   }
