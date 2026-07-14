@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::error::IdentityError;
+use crate::error::{CardError, IdentityError};
 use crate::kdf::{self, Argon2Params, DerivedKeys, KEY_LEN, SALT_LEN};
 
 const NONCE_LEN: usize = 12;
@@ -30,6 +30,16 @@ const KEYFILE_VERSION: u8 = 1;
 /// key; tagging keeps a future change to one from silently changing the other. Mirrors
 /// `content.rs`'s `DOMAIN_TAG` pattern for signed bytes.
 const FINGERPRINT_DOMAIN_TAG: &[u8] = b"sympoden-fingerprint-v1\0";
+
+/// Domain-separates a `SignedCard`'s signed bytes from a note's (`content.rs`'s
+/// `DOMAIN_TAG`) and from a fingerprint hash (`FINGERPRINT_DOMAIN_TAG`) — a card
+/// signature can never be replayed as either. The `-v2` names the *card format
+/// generation* this slice introduces; there never was a signed `-v1` card (the old
+/// shape, `PublicCard`, was never signed at all — "v1" only exists in prose).
+const CARD_DOMAIN_TAG: &[u8] = b"sympoden-card-v2\0";
+
+/// The only card version this build understands. See `SignedCard::parse_and_verify`.
+const CARD_VERSION: u8 = 2;
 
 /// 80 bits (SLICE-03.md D5/Adjustment 2): a slice of an already-computed hash, so the
 /// extra bits over a shorter prefix cost nothing in compute or storage. Used uniformly
@@ -100,6 +110,51 @@ pub struct Identity {
 pub struct PublicCard {
     pub ed25519_public: String, // base64
     pub x25519_public: String,  // base64
+}
+
+/// The wire artifact from Slice 05 on: a card is a self-verifiable claim, not just a
+/// pair of keys — the identity's own Ed25519 key signs its paired X25519 key, so
+/// anyone holding the card can confirm the two were issued together (SLICE-05.md D-A).
+/// This is the only thing that travels out-of-band as "a card"; `PublicCard` above is
+/// kept, unchanged, purely as `sync.rs`'s internal "a pinned peer's two keys"
+/// reconstruction, which can never carry a signature (it is never built from a private
+/// key this device holds).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedCard {
+    pub version: u8,             // = CARD_VERSION, always. Absent or other is rejected.
+    pub ed25519_public: String,  // base64 — same encoding PublicCard already uses
+    pub x25519_public: String,   // base64
+    pub signature: String,       // base64, ed25519 signature over canonical_bytes below
+}
+
+/// A `SignedCard` that has passed every structural and cryptographic check in
+/// `SignedCard::parse_and_verify` — real curve points, a signature that verifies over
+/// them. Deliberately holds typed keys, not the base64 strings `SignedCard` carries,
+/// so a caller can't accidentally skip back to unverified data.
+#[derive(Debug, Clone)]
+pub struct VerifiedCard {
+    pub ed25519_pubkey: VerifyingKey,
+    pub x25519_pubkey: X25519PublicKey,
+}
+
+/// The signed bytes for a card: `domain_tag ‖ version ‖ ed25519_public ‖ x25519_public`
+/// — all four under the signature, non-negotiable (SLICE-05.md D-A). The version is
+/// signed, not just implied by which domain tag verified, so an on-path edit to it
+/// (up or down) invalidates the signature instead of silently downgrading/upgrading a
+/// future format; the Ed25519 key is signed too, so nothing an attacker could touch is
+/// left uncovered. No length-prefixing needed: the tag is constant, `version` is one
+/// fixed byte, and both keys are fixed 32-byte arrays.
+fn card_canonical_bytes(
+    version: u8,
+    ed25519_public: &VerifyingKey,
+    x25519_public: &X25519PublicKey,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CARD_DOMAIN_TAG.len() + 1 + 32 + 32);
+    bytes.extend_from_slice(CARD_DOMAIN_TAG);
+    bytes.push(version);
+    bytes.extend_from_slice(ed25519_public.as_bytes());
+    bytes.extend_from_slice(x25519_public.as_bytes());
+    bytes
 }
 
 impl Identity {
@@ -304,7 +359,32 @@ impl Identity {
         })
     }
 
-    /// The public identity card to share with a peer out-of-band.
+    /// The self-signed public identity card to share with a peer out-of-band, as a
+    /// ready-to-paste base64 string — the only place a `SignedCard` is ever assembled
+    /// or signed (SLICE-05.md D-E: JS never composes, encodes, or signs a card).
+    pub fn card_encoded(&self) -> String {
+        let ed25519_public = self.signing_key.verifying_key();
+        let x25519_public = X25519PublicKey::from(&self.x25519_secret);
+        let canonical = card_canonical_bytes(CARD_VERSION, &ed25519_public, &x25519_public);
+        let signature = crate::crypto::sign(&self.signing_key, &canonical);
+        let card = SignedCard {
+            version: CARD_VERSION,
+            ed25519_public: BASE64.encode(ed25519_public.to_bytes()),
+            x25519_public: BASE64.encode(x25519_public.to_bytes()),
+            signature: BASE64.encode(signature.to_bytes()),
+        };
+        // Infallible: every field is our own freshly-encoded data, never user input.
+        BASE64.encode(serde_json::to_vec(&card).unwrap_or_default())
+    }
+
+    /// Kept, unremoved, deliberately: `sync.rs`'s own test module builds a `PublicCard`
+    /// this way (`sync.rs:164`/`sync.rs:205`) and `sync.rs` is held at zero diff this
+    /// slice (SLICE-05.md's terms) — removing this method would force editing sync.rs's
+    /// tests to compile, which the zero-diff mandate forbids. SLICE-05.md's D-A assumed
+    /// `cmd_whoami`/the app's `whoami` were `public_card`'s only callers; this third,
+    /// test-only caller wasn't in that survey. Production code (CLI/app `whoami`) uses
+    /// `card_encoded` exclusively from this slice on; this method is otherwise dead in
+    /// production, kept alive only by sync.rs's tests.
     pub fn public_card(&self) -> PublicCard {
         PublicCard {
             ed25519_public: BASE64.encode(self.signing_key.verifying_key().to_bytes()),
@@ -347,6 +427,104 @@ impl PublicCard {
         })?;
         Ok(X25519PublicKey::from(bytes))
     }
+}
+
+impl SignedCard {
+    /// Parse and verify a pasted card, in one call — the only way `SignedCard` bytes
+    /// are ever turned into trusted keys (SLICE-05.md D-D). Every structural check
+    /// (base64, JSON, the legacy-vs-versioned distinction, shape, known version, key
+    /// and signature lengths) completes before signature verification is even
+    /// attempted: no signature verification runs on a card that fails a structural
+    /// check, so "old card" and "tampered card" can never be confused with each other.
+    pub fn parse_and_verify(card_base64: &str) -> Result<VerifiedCard, CardError> {
+        let decoded = BASE64
+            .decode(card_base64.trim())
+            .map_err(|e| CardError::NotBase64(e.to_string()))?;
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&decoded).map_err(|e| CardError::NotJson(e.to_string()))?;
+
+        if value.get("version").is_none() {
+            return Err(CardError::LegacyUnsigned);
+        }
+
+        let card: SignedCard =
+            serde_json::from_value(value).map_err(|e| CardError::Malformed(e.to_string()))?;
+
+        if card.version != CARD_VERSION {
+            return Err(CardError::UnsupportedVersion(card.version));
+        }
+
+        let ed25519_pubkey = card.ed25519_verifying_key()?;
+        let x25519_pubkey = card.x25519_public_key()?;
+
+        let signature_bytes = BASE64
+            .decode(&card.signature)
+            .map_err(|_| CardError::MalformedSignature)?;
+        let signature_bytes: [u8; 64] = signature_bytes
+            .try_into()
+            .map_err(|_| CardError::MalformedSignature)?;
+        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+
+        let canonical = card_canonical_bytes(card.version, &ed25519_pubkey, &x25519_pubkey);
+        crate::crypto::verify(&ed25519_pubkey, &canonical, &signature)
+            .map_err(|_| CardError::SignatureInvalid)?;
+
+        Ok(VerifiedCard {
+            ed25519_pubkey,
+            x25519_pubkey,
+        })
+    }
+
+    /// Same decode logic `PublicCard::ed25519_verifying_key` uses — `SignedCard` and
+    /// `PublicCard` carry the same base64 encoding for this field, only `SignedCard`
+    /// also carries `version`/`signature`.
+    fn ed25519_verifying_key(&self) -> Result<VerifyingKey, IdentityError> {
+        let bytes = BASE64
+            .decode(&self.ed25519_public)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            IdentityError::Malformed("ed25519 public key has the wrong length".to_string())
+        })?;
+        VerifyingKey::from_bytes(&bytes).map_err(|e| IdentityError::Malformed(e.to_string()))
+    }
+
+    fn x25519_public_key(&self) -> Result<X25519PublicKey, IdentityError> {
+        let bytes = BASE64
+            .decode(&self.x25519_public)
+            .map_err(|e| IdentityError::Malformed(e.to_string()))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            IdentityError::Malformed("x25519 public key has the wrong length".to_string())
+        })?;
+        Ok(X25519PublicKey::from(bytes))
+    }
+}
+
+/// D-C's engine-shared reject: does `card`'s X25519 key match the one already on file
+/// for `pinned`'s Ed25519 key? Pure data in, `Result` out — no `Store` access, no I/O.
+/// Takes the already-typed `VerifiedCard` (not the still-encoded `SignedCard`) so this
+/// doesn't re-decode base64 `parse_and_verify` just decoded a moment earlier.
+///
+/// The Ed25519 key is identical on both sides of this conflict by construction (that's
+/// what "already pinned under this key" means), so the message names the peer once
+/// (label + its one shared Ed25519 fingerprint) and shows two X25519 fingerprints —
+/// the key on file and the key this card offers — using the same
+/// `fingerprint_hex`/`format_fingerprint` display machinery already used for Ed25519
+/// fingerprints everywhere else (SLICE-05.md D-C).
+pub fn check_card_against_pin(
+    card: &VerifiedCard,
+    pinned: &crate::store::PinnedPeer,
+) -> Result<(), CardError> {
+    let offered_x25519_hex = hex::encode(card.x25519_pubkey.to_bytes());
+    if offered_x25519_hex != pinned.x25519_pubkey {
+        return Err(CardError::PinnedKeyConflict {
+            label: pinned.label.clone(),
+            ed25519_fingerprint: format_fingerprint(&fingerprint_hex(&pinned.ed25519_pubkey)),
+            existing_x25519_display: format_fingerprint(&fingerprint_hex(&pinned.x25519_pubkey)),
+            offered_x25519_display: format_fingerprint(&fingerprint_hex(&offered_x25519_hex)),
+        });
+    }
+    Ok(())
 }
 
 /// A short, stable, human-comparable fingerprint for an Ed25519 public key, given as
@@ -492,6 +670,217 @@ mod tests {
             reconstructed.x25519_public_key().unwrap().to_bytes(),
             X25519PublicKey::from(&bob.x25519_secret).to_bytes()
         );
+    }
+
+    fn make_identity(dir: &tempfile::TempDir, name: &str) -> Identity {
+        Identity::create(&dir.path().join(name), "passphrase").unwrap()
+    }
+
+    /// Decode a `card_encoded()` string back into its `SignedCard` JSON `Value`, so a
+    /// test can tamper a single field and re-encode - the same shape a hand-edited
+    /// card sent by an attacker would have.
+    fn decode_card_json(card_base64: &str) -> serde_json::Value {
+        let bytes = BASE64.decode(card_base64.trim()).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn encode_card_json(value: &serde_json::Value) -> String {
+        BASE64.encode(serde_json::to_vec(value).unwrap())
+    }
+
+    #[test]
+    fn a_freshly_signed_card_verifies() {
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+
+        let verified = SignedCard::parse_and_verify(&identity.card_encoded()).unwrap();
+
+        assert_eq!(verified.ed25519_pubkey, identity.signing_key.verifying_key());
+        assert_eq!(
+            verified.x25519_pubkey.to_bytes(),
+            X25519PublicKey::from(&identity.x25519_secret).to_bytes()
+        );
+    }
+
+    #[test]
+    fn card_round_trips_through_encode_and_verify() {
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+        let encoded = identity.card_encoded();
+
+        let verified = SignedCard::parse_and_verify(&encoded).unwrap();
+        assert_eq!(verified.ed25519_pubkey, identity.signing_key.verifying_key());
+        assert_eq!(
+            verified.x25519_pubkey.to_bytes(),
+            X25519PublicKey::from(&identity.x25519_secret).to_bytes()
+        );
+    }
+
+    #[test]
+    fn tampering_the_x25519_field_after_signing_fails_verification() {
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+        let other = make_identity(&dir, "other.json");
+
+        let mut value = decode_card_json(&identity.card_encoded());
+        let swapped_x25519 =
+            BASE64.encode(X25519PublicKey::from(&other.x25519_secret).to_bytes());
+        value["x25519_public"] = serde_json::Value::String(swapped_x25519);
+        let tampered = encode_card_json(&value);
+
+        let result = SignedCard::parse_and_verify(&tampered);
+        assert!(matches!(result, Err(CardError::SignatureInvalid)));
+    }
+
+    #[test]
+    fn version_byte_is_genuinely_inside_the_signed_bytes() {
+        // SLICE-05.md D-A's crux, proved directly against `card_canonical_bytes` and
+        // `crypto::verify` - not through `SignedCard::parse_and_verify`. With only one
+        // supported version defined (`CARD_VERSION == 2`), `parse_and_verify`'s gate
+        // order (SLICE-05.md D-D: structural checks, including the version check,
+        // before any crypto) means an edited version is always intercepted at gate 5
+        // as `UnsupportedVersion` before `crypto::verify` ever runs - so this property
+        // isn't observable as `SignatureInvalid` end to end today (see SLICE-05.md
+        // AC3). What's actually being guaranteed - that the version byte is under the
+        // signature, so a future v3 can't be downgraded to v2 by editing the field
+        // alone - is exactly what this lower-level test checks.
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+        let ed25519_public = identity.signing_key.verifying_key();
+        let x25519_public = X25519PublicKey::from(&identity.x25519_secret);
+
+        let signed_bytes = card_canonical_bytes(2, &ed25519_public, &x25519_public);
+        let signature = crate::crypto::sign(&identity.signing_key, &signed_bytes);
+
+        // Verifies against the bytes it was actually signed over.
+        assert!(crate::crypto::verify(&ed25519_public, &signed_bytes, &signature).is_ok());
+
+        // The same signature must NOT verify against a claim with the version edited -
+        // if the version weren't part of the signed bytes, this would wrongly succeed.
+        let claimed_different_version = card_canonical_bytes(3, &ed25519_public, &x25519_public);
+        assert!(
+            crate::crypto::verify(&ed25519_public, &claimed_different_version, &signature)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tampering_the_signature_bytes_fails_verification() {
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+
+        let mut value = decode_card_json(&identity.card_encoded());
+        let sig_b64 = value["signature"].as_str().unwrap().to_string();
+        let mut sig_bytes = BASE64.decode(&sig_b64).unwrap();
+        sig_bytes[0] ^= 0xFF;
+        value["signature"] = serde_json::Value::String(BASE64.encode(sig_bytes));
+        let tampered = encode_card_json(&value);
+
+        let result = SignedCard::parse_and_verify(&tampered);
+        assert!(matches!(result, Err(CardError::SignatureInvalid)));
+    }
+
+    #[test]
+    fn a_hand_built_legacy_shaped_card_is_rejected_as_legacy_unsigned() {
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+        let legacy = identity.public_card(); // today's exact shape: no version field
+
+        let encoded = BASE64.encode(serde_json::to_vec(&legacy).unwrap());
+        let result = SignedCard::parse_and_verify(&encoded);
+        assert!(matches!(result, Err(CardError::LegacyUnsigned)));
+    }
+
+    #[test]
+    fn a_version_3_card_yields_unsupported_version() {
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+
+        let mut value = decode_card_json(&identity.card_encoded());
+        value["version"] = serde_json::Value::Number(3u8.into());
+        let card = encode_card_json(&value);
+
+        let result = SignedCard::parse_and_verify(&card);
+        assert!(matches!(result, Err(CardError::UnsupportedVersion(3))));
+    }
+
+    #[test]
+    fn garbage_base64_yields_not_base64() {
+        let result = SignedCard::parse_and_verify("not valid base64 at all!!!");
+        assert!(matches!(result, Err(CardError::NotBase64(_))));
+    }
+
+    #[test]
+    fn garbage_json_yields_not_json() {
+        let garbage = BASE64.encode(b"not json");
+        let result = SignedCard::parse_and_verify(&garbage);
+        assert!(matches!(result, Err(CardError::NotJson(_))));
+    }
+
+    #[test]
+    fn check_card_against_pin_accepts_a_matching_x25519_key() {
+        use crate::store::PinnedPeer;
+
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+        let verified = SignedCard::parse_and_verify(&identity.card_encoded()).unwrap();
+
+        let pinned = PinnedPeer {
+            label: "bob".to_string(),
+            ed25519_pubkey: hex::encode(verified.ed25519_pubkey.as_bytes()),
+            x25519_pubkey: hex::encode(verified.x25519_pubkey.to_bytes()),
+            first_seen: 1_700_000_000,
+        };
+
+        assert!(check_card_against_pin(&verified, &pinned).is_ok());
+    }
+
+    #[test]
+    fn check_card_against_pin_rejects_a_different_x25519_key_with_full_display_fields() {
+        use crate::store::PinnedPeer;
+
+        let dir = tempdir().unwrap();
+        let identity = make_identity(&dir, "id.json");
+        let other = make_identity(&dir, "other.json");
+        let verified = SignedCard::parse_and_verify(&identity.card_encoded()).unwrap();
+
+        let pinned = PinnedPeer {
+            label: "bob".to_string(),
+            ed25519_pubkey: hex::encode(verified.ed25519_pubkey.as_bytes()),
+            // A different X25519 key on file than the card offers.
+            x25519_pubkey: hex::encode(
+                X25519PublicKey::from(&other.x25519_secret).to_bytes(),
+            ),
+            first_seen: 1_700_000_000,
+        };
+
+        let result = check_card_against_pin(&verified, &pinned);
+        match result {
+            Err(CardError::PinnedKeyConflict {
+                label,
+                ed25519_fingerprint,
+                existing_x25519_display,
+                offered_x25519_display,
+            }) => {
+                assert_eq!(label, "bob");
+                assert_eq!(
+                    ed25519_fingerprint,
+                    format_fingerprint(&fingerprint_hex(&pinned.ed25519_pubkey))
+                );
+                assert_eq!(
+                    existing_x25519_display,
+                    format_fingerprint(&fingerprint_hex(&pinned.x25519_pubkey))
+                );
+                assert_eq!(
+                    offered_x25519_display,
+                    format_fingerprint(&fingerprint_hex(&hex::encode(
+                        verified.x25519_pubkey.to_bytes()
+                    )))
+                );
+                assert_ne!(existing_x25519_display, offered_x25519_display);
+            }
+            other => panic!("expected PinnedKeyConflict, got {other:?}"),
+        }
     }
 
     #[test]
