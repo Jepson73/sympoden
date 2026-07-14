@@ -25,6 +25,14 @@
 # note from it is decrypted/verified then dropped before storage. Delete and block are
 # independently invokable, not welded together - a UI/CLI default may couple them, but
 # each is separately expressible. See docs/slices/SLICE-04.md.
+#
+# Slice 05 (self-signed peer cards): a card's Ed25519 key now signs its paired X25519
+# key, so a card whose X25519 half was substituted in transit (or whose signature was
+# corrupted) is rejected before pinning, never silently accepted; a pre-Slice-05
+# unsigned card gets a friendly "ask for a fresh card" message, not a generic error; a
+# validly-signed card for an already-pinned identity claiming a *different* X25519 key
+# is rejected loudly, naming the peer and both X25519 fingerprints, and never touches
+# the stored pin. See docs/slices/SLICE-05.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -35,6 +43,12 @@ echo "==> Building the headless crates (engine, relay, cli)"
 # default-members for the same reason; build it explicitly and separately once those
 # prerequisites are met.
 cargo build -p sympoden-engine -p sympoden-relay -p sympoden-cli --quiet
+# mint_conflicting_card: a test-fixture-only binary (not a CLI subcommand, not shipped
+# anywhere else) used solely by the Slice 05 D-C case below, where constructing a
+# *validly signed* card claiming a different X25519 key requires the real Ed25519
+# private key - something sympoden-cli deliberately exposes no command for (rotation is
+# an explicit non-goal; see sympoden-engine/examples/mint_conflicting_card.rs).
+cargo build -p sympoden-engine --example mint_conflicting_card --quiet
 
 echo "==> Verifying the relay has zero dependency on any crypto/identity crate"
 if cargo tree -p sympoden-relay | grep -Ei 'dalek|chacha20poly1305|argon2|sha2|hkdf'; then
@@ -54,6 +68,50 @@ echo "OK: no telemetry/analytics dependency found in the headless crates"
 CLI="./target/debug/sympoden-cli"
 RELAY="./target/debug/sympoden-relay"
 RELAY_ADDR="127.0.0.1:18733"
+MINT_CONFLICTING_CARD="./target/debug/examples/mint_conflicting_card"
+
+# Slice 05 helpers: a card is base64(JSON) (SLICE-05.md D-E: opaque outside Rust) - the
+# only way to hand-tamper one for a demo script is to decode, edit a field, and
+# re-encode. python3's stdlib json/base64 does this without a jq dependency.
+tamper_card_field() {
+    # usage: tamper_card_field <card-base64> <field-name> <new-value>
+    python3 -c '
+import base64, json, sys
+card_b64, field, value = sys.argv[1], sys.argv[2], sys.argv[3]
+obj = json.loads(base64.b64decode(card_b64))
+obj[field] = value
+print(base64.b64encode(json.dumps(obj).encode()).decode())
+' "$1" "$2" "$3"
+}
+card_field() {
+    # usage: card_field <card-base64> <field-name>
+    python3 -c '
+import base64, json, sys
+print(json.loads(base64.b64decode(sys.argv[1]))[sys.argv[2]])
+' "$1" "$2"
+}
+flip_signature_byte() {
+    # usage: flip_signature_byte <card-base64> -> a card with the same keys/version but
+    # a corrupted signature (still valid base64, different bytes).
+    python3 -c '
+import base64, json, sys
+obj = json.loads(base64.b64decode(sys.argv[1]))
+sig = bytearray(base64.b64decode(obj["signature"]))
+sig[0] ^= 0xFF
+obj["signature"] = base64.b64encode(bytes(sig)).decode()
+print(base64.b64encode(json.dumps(obj).encode()).decode())
+' "$1"
+}
+strip_to_legacy_shape() {
+    # usage: strip_to_legacy_shape <card-base64> -> today's pre-Slice-05 shape: only
+    # the two bare keys, no version/signature.
+    python3 -c '
+import base64, json, sys
+obj = json.loads(base64.b64decode(sys.argv[1]))
+legacy = {"ed25519_public": obj["ed25519_public"], "x25519_public": obj["x25519_public"]}
+print(base64.b64encode(json.dumps(legacy).encode()).decode())
+' "$1"
+}
 
 WORKDIR=$(mktemp -d)
 RELAY_PID=""
@@ -574,5 +632,94 @@ if printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-peers | grep -q '^m
 fi
 echo "OK: add-peer refused to pin Kate's own card, nothing written (AC7)"
 
+echo "==> Slice 05 setup: Rose, freshly pinned by Kate with a genuine v2 signed card"
+ROSE_DIR="$WORKDIR/rose"
+printf 'rose-pass\nrose-pass\n' | "$CLI" --data-dir "$ROSE_DIR" init >/dev/null
+ROSE_CARD=$(printf 'rose-pass\n' | "$CLI" --data-dir "$ROSE_DIR" whoami)
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer rose "$ROSE_CARD" >/dev/null
+if ! printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-peers | grep -q '^rose ('; then
+    echo "FAIL: expected a freshly generated v2 signed card to pin normally"
+    exit 1
+fi
+echo "OK: a fresh v2 signed card pinned normally through the existing add-peer flow (SLICE-05 AC1)"
+
+echo "==> Slice 05: a card with a tampered X25519 key is rejected, nothing written (AC2)"
+SIBYL_DIR="$WORKDIR/sibyl"
+printf 'sibyl-pass\nsibyl-pass\n' | "$CLI" --data-dir "$SIBYL_DIR" init >/dev/null
+SIBYL_CARD=$(printf 'sibyl-pass\n' | "$CLI" --data-dir "$SIBYL_DIR" whoami)
+SIBYL_X25519=$(card_field "$SIBYL_CARD" x25519_public)
+# A card claiming Rose's Ed25519 identity but Sibyl's X25519 key - the signature no
+# longer verifies over the edited claim.
+TAMPERED_X25519_CARD=$(tamper_card_field "$ROSE_CARD" x25519_public "$SIBYL_X25519")
+set +e
+TAMPER_OUTPUT=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer rose2 "$TAMPERED_X25519_CARD" 2>&1)
+TAMPER_STATUS=$?
+set -e
+if [ "$TAMPER_STATUS" -eq 0 ] || ! echo "$TAMPER_OUTPUT" | grep -qi "does not verify"; then
+    echo "FAIL: expected a tampered-X25519 card to be rejected with a signature error, got: $TAMPER_OUTPUT"
+    exit 1
+fi
+if printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-peers | grep -q '^rose2 ('; then
+    echo "FAIL: a rejected tampered card must never be pinned"
+    exit 1
+fi
+echo "OK: a card with a substituted X25519 key was rejected before pinning, nothing written (SLICE-05 AC2)"
+
+echo "==> Slice 05: a card with a corrupted signature is rejected, nothing written (AC4)"
+TAMPERED_SIG_CARD=$(flip_signature_byte "$ROSE_CARD")
+set +e
+SIG_TAMPER_OUTPUT=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer rose3 "$TAMPERED_SIG_CARD" 2>&1)
+SIG_TAMPER_STATUS=$?
+set -e
+if [ "$SIG_TAMPER_STATUS" -eq 0 ] || ! echo "$SIG_TAMPER_OUTPUT" | grep -qi "does not verify"; then
+    echo "FAIL: expected a tampered-signature card to be rejected, got: $SIG_TAMPER_OUTPUT"
+    exit 1
+fi
+if printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" list-peers | grep -q '^rose3 ('; then
+    echo "FAIL: a rejected tampered-signature card must never be pinned"
+    exit 1
+fi
+echo "OK: a card with a corrupted signature was rejected before pinning, nothing written (SLICE-05 AC4)"
+
+echo "==> Slice 05: a legacy (pre-Slice-05, unsigned) card gets a friendly message, not a generic error (AC5)"
+LEGACY_CARD=$(strip_to_legacy_shape "$SIBYL_CARD")
+set +e
+LEGACY_OUTPUT=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer sibyl "$LEGACY_CARD" 2>&1)
+LEGACY_STATUS=$?
+set -e
+if [ "$LEGACY_STATUS" -eq 0 ] || ! echo "$LEGACY_OUTPUT" | grep -qi "older version of sympoden"; then
+    echo "FAIL: expected a legacy-shaped card to be rejected with the friendly older-version message, got: $LEGACY_OUTPUT"
+    exit 1
+fi
+echo "OK: a legacy unsigned card was rejected with the friendly ask-for-a-fresh-card message, not a generic error (SLICE-05 AC5)"
+
+echo "==> Slice 05 (D-C): a validly-signed card for Rose's identity claiming a *different* X25519 key is rejected loudly, her pin untouched (AC7)"
+CONFLICTING_ROSE_CARD=$("$MINT_CONFLICTING_CARD" "$ROSE_DIR/identity.keyfile.json" "rose-pass")
+set +e
+CONFLICT_OUTPUT=$(printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" add-peer rose "$CONFLICTING_ROSE_CARD" 2>&1)
+CONFLICT_STATUS=$?
+set -e
+if [ "$CONFLICT_STATUS" -eq 0 ] || ! echo "$CONFLICT_OUTPUT" | grep -qi "already pinned with a different encryption key"; then
+    echo "FAIL: expected the D-C conflicting-X25519 case to be rejected loudly, got: $CONFLICT_OUTPUT"
+    exit 1
+fi
+if ! echo "$CONFLICT_OUTPUT" | grep -qi "rose ("; then
+    echo "FAIL: expected the D-C rejection to name the peer (rose), got: $CONFLICT_OUTPUT"
+    exit 1
+fi
+# Indirect proof the stored pin is untouched (the CLI has no direct "show x25519"
+# command): Kate sends Rose a note using the pin as stored; it must still decrypt
+# cleanly under Rose's *original* X25519 key, proving the rejected card never wrote
+# through.
+ROSE_PROOF_BODY="proof kate's pin of rose still uses her original key - $(date +%s)"
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" post "$ROSE_PROOF_BODY" --to rose >/dev/null
+printf 'kate-pass\n' | "$CLI" --data-dir "$KATE_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+printf 'rose-pass\n' | "$CLI" --data-dir "$ROSE_DIR" sync --relay "$RELAY_ADDR" >/dev/null
+if ! printf 'rose-pass\n' | "$CLI" --data-dir "$ROSE_DIR" list | grep -qF "$ROSE_PROOF_BODY"; then
+    echo "FAIL: Rose could not decrypt a note sealed under Kate's stored pin - the rejected D-C card must have corrupted it"
+    exit 1
+fi
+echo "OK: the D-C conflicting-X25519 card was rejected loudly, naming the peer; Kate's stored pin for Rose was left untouched (SLICE-05 D-C, AC7)"
+
 echo
-echo "All Slice 01, Slice 02, Slice 03, and Slice 04 acceptance criteria demonstrated successfully."
+echo "All Slice 01, Slice 02, Slice 03, Slice 04, and Slice 05 acceptance criteria demonstrated successfully."
